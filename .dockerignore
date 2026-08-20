@@ -1,0 +1,34 @@
+# Docker 构建上下文裁剪：COPY . 时排除以下内容（模型/缓存/开发产物不进镜像）
+.git
+.gitignore
+.dockerignore
+
+# 本地模型与离线部署产物（体积大，运行时外挂提供）
+Qwen3-ASR-*/
+Qwen3-ForcedAligner-*/
+hf-cache/
+*.tar.gz
+*.safetensors
+*.bin
+*.pth
+*.onnx
+
+# Python 构建产物
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# IDE / 工作流目录
+.idea/
+.vscode/
+.trae/
+.claude/
+.spec-workflow/
+
+# Docker 自身
+docker/Dockerfile-*
+Dockerfile*

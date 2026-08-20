@@ -495,3 +495,50 @@ def merge_languages(langs: List[str]) -> str:
         out.append(x)
         prev = x
     return ",".join(out)
+
+
+def offset_align_result(result: Any, offset_sec: float) -> Any:
+    """
+    Apply time offset to a ForcedAlignResult-like object.
+
+    This function assumes:
+      - result has attribute `.items` which is a list of items with start_time/end_time in seconds.
+      - dataclasses are frozen in upstream implementation, so we reconstruct by type.
+
+    Args:
+        result: ForcedAlignResult
+        offset_sec: Offset in seconds
+
+    Returns:
+        ForcedAlignResult: New object with shifted timestamps.
+    """
+    if result is None:
+        return None
+    items = []
+    for it in result.items:
+        items.append(type(it)(text=it.text,
+                              start_time=round(it.start_time + offset_sec, 3),
+                              end_time=round(it.end_time + offset_sec, 3)))
+    return type(result)(items=items)
+
+
+def merge_align_results(results: List[Any]) -> Optional[Any]:
+    """
+    Merge multiple ForcedAlignResult objects into a single one by concatenating items.
+
+    Args:
+        results: List of ForcedAlignResult
+
+    Returns:
+        ForcedAlignResult or None
+    """
+    if not results:
+        return None
+    all_items = []
+    for r in results:
+        if r is None:
+            continue
+        all_items.extend(list(r.items))
+    if not all_items:
+        return None
+    return type(results[0])(items=all_items)

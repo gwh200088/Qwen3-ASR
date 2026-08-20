@@ -38,9 +38,11 @@ from .utils import (
     AudioChunk,
     AudioLike,
     chunk_list,
+    merge_align_results,
     merge_languages,
     normalize_audios,
     normalize_language_name,
+    offset_align_result,
     parse_asr_output,
     split_audio_into_chunks,
     validate_language,
@@ -537,49 +539,14 @@ class Qwen3ASRModel:
         return outs
 
     def _offset_align_result(self, result: Any, offset_sec: float) -> Any:
-        """
-        Apply time offset to a ForcedAlignResult-like object.
-
-        This function assumes:
-          - result has attribute `.items` which is a list of items with start_time/end_time in seconds.
-          - dataclasses are frozen in upstream implementation, so we reconstruct by type.
-
-        Args:
-            result: ForcedAlignResult
-            offset_sec: Offset in seconds
-
-        Returns:
-            ForcedAlignResult: New object with shifted timestamps.
-        """
-        if result is None:
-            return None
-        items = []
-        for it in result.items:
-            items.append(type(it)(text=it.text, 
-                                  start_time=round(it.start_time + offset_sec, 3), 
-                                  end_time=round(it.end_time + offset_sec, 3)))
-        return type(result)(items=items)
+        """Delegate to the public utils function offset_align_result."""
+        # 委托 utils 公开函数，保持对外行为不变
+        return offset_align_result(result, offset_sec)
 
     def _merge_align_results(self, results: List[Any]) -> Optional[Any]:
-        """
-        Merge multiple ForcedAlignResult objects into a single one by concatenating items.
-
-        Args:
-            results: List of ForcedAlignResult
-
-        Returns:
-            ForcedAlignResult or None
-        """
-        if not results:
-            return None
-        all_items = []
-        for r in results:
-            if r is None:
-                continue
-            all_items.extend(list(r.items))
-        if not all_items:
-            return None
-        return type(results[0])(items=all_items)
+        """Delegate to the public utils function merge_align_results."""
+        # 委托 utils 公开函数，保持对外行为不变
+        return merge_align_results(results)
 
     def init_streaming_state(
         self,

@@ -37,6 +37,7 @@ dependencies = [
 vllm = [
   "vllm==0.14.0",
 ]
+diarization = ["pyannote.audio==4.0.7"]
 
 [project.urls]
 Homepage = "https://github.com/Qwen/Qwen3-ASR"

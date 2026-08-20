@@ -42,13 +42,32 @@ ENV CCACHE_DIR=/root/.cache/ccache
 
 ARG BUNDLE_FLASH_ATTENTION=true
 
+# pyannote community-1 为 HF 门控（gated）模型，构建期预下载需要 token；
+# 若不想在构建期传入，运行时通过 -e HF_TOKEN 提供即可
+ARG HF_TOKEN=
+ENV HF_TOKEN=${HF_TOKEN}
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install -U pip setuptools wheel
 
 RUN apt remove python3-blinker -y
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install -U "qwen-asr[vllm]"
+    pip3 install -U "qwen-asr[vllm,diarization]"
+
+# 构建期预下载扩展模型（ASR 主模型体积大且因部署而异，仍由运行时/挂载提供）：
+# - Qwen/Qwen3-ForcedAligner-0.6B（对齐扩展，非门控）
+# - pyannote/speaker-diarization-community-1（说话人识别扩展，HF 门控，需 token）
+# 传入构建参数 --build-arg HF_TOKEN=hf_xxx 后写入镜像内 HF 缓存（/root/.cache/huggingface），
+# 运行时无需再联网下载；未传 token 时跳过预下载（首次请求时自动下载，
+# 注意门控模型需先在 hf.co 接受访问条款并通过 -e HF_TOKEN 提供令牌）。
+RUN if [ -n "$HF_TOKEN" ]; then \
+        python3 -c "from huggingface_hub import snapshot_download; \
+snapshot_download('Qwen/Qwen3-ForcedAligner-0.6B'); \
+snapshot_download('pyannote/speaker-diarization-community-1')"; \
+    else \
+        echo "HF_TOKEN 未提供，跳过扩展模型预下载（运行时首次请求将自动下载）"; \
+    fi
 
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/root/.cache/pip \

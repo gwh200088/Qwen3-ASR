@@ -17,9 +17,18 @@
 qwen_asr: Qwen3-ASR package.
 """
 
+from importlib.metadata import version as _pkg_version
+
 from .inference.qwen3_asr import Qwen3ASRModel
 from .inference.qwen3_forced_aligner import Qwen3ForcedAligner
+from .inference.qwen3_speaker_diarizer import SpeakerDiarizer
 
 from .inference.utils import parse_asr_output
 
-__all__ = ["__version__"]
+try:
+    __version__ = _pkg_version("qwen-asr")
+except Exception:
+    # 未安装或包元数据不可用时回退占位版本，保证 from qwen_asr import * 不再 AttributeError
+    __version__ = "0.0.0"
+
+__all__ = ["Qwen3ASRModel", "Qwen3ForcedAligner", "SpeakerDiarizer", "parse_asr_output", "__version__"]

@@ -49,9 +49,15 @@ RUN apt remove python3-blinker -y
 
 # 从本地源码安装（非 PyPI 发布版）——segment 时间戳 + 说话人识别扩展仅存在于本仓库，
 # PyPI 的 qwen-asr 不含该功能。依赖（vllm/transformers/pyannote 等）仍从 PyPI 解析。
+# torchcodec 版本配对修正：vllm==0.14.0 锁定 torch 2.9.1+cu128，而 pyannote.audio
+# 传递依赖的 torchcodec 最新版（0.14+）按 CUDA 13 构建，链接 libnvrtc.so.13，在
+# CUDA 12.8 镜像内加载失败（import torchcodec 即 RuntimeError）；0.13.x 是 torch 2.9
+# 的官方配对版本（cu128 构建）。pyannote 输入走内存 waveform 字典不依赖其解码器，
+# 但保持 torchcodec 可 import 以满足依赖健康检查。
 COPY . /data/shared/Qwen3-ASR
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install -U "/data/shared/Qwen3-ASR[vllm,diarization]"
+    pip3 install -U "/data/shared/Qwen3-ASR[vllm,diarization]" \
+    && pip3 install -U "torchcodec==0.13.*"
 
 # 扩展模型（Qwen3-ForcedAligner-0.6B / pyannote community-1 及其子模型）与 ASR 主模型
 # 不打进镜像，统一由运行时挂载 HF_HOME 缓存卷 + 本地模型目录提供，便于离线部署与模型更新：

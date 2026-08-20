@@ -223,15 +223,32 @@ docker rm -f offline-rehearsal
 
 任一验证失败 → 按 §8 排查修复后重跑，**禁止带病交付**。
 
-### 3.6 打包镜像
+### 3.6 构建热修复镜像（生产交付镜像，必须执行）
+
+GPU 实机首跑（2026-08-20，A10）发现 3 个运行时问题，已修复在仓库源码并通过
+`docker/Dockerfile-qwen3-asr-hotfix` 叠加到基础镜像之上：
+
+| # | 修复文件 | 问题 |
+|---|---|---|
+| fix1 | `qwen_asr/inference/qwen3_speaker_diarizer.py` | pyannote 4.x `Pipeline.to()` 要求 `torch.device` 实例，传 str 抛 TypeError |
+| fix2 | `qwen_asr/cli/serve.py` | vLLM 0.14.0 SageMaker bootstrap 预建中间件栈，`add_middleware` 误报已启动 |
+| fix3 | `qwen_asr/service/middleware.py` | PyTorch 缓存分配器不归还空闲显存块 → 调度器准入误判，首任务成功后其余请求永久排队 |
 
 ```bash
-docker save qwen3-asr-offline:cu128 | gzip > qwen3-asr-offline-cu128.tar.gz
+# 仓库根目录执行（基于已存在的 qwen3-asr-offline:cu128，仅追加 3 个源文件层，秒级完成）
+docker build -f docker/Dockerfile-qwen3-asr-hotfix -t qwen3-asr-offline:cu128-hotfix .
 ```
 
-最终交付物：`qwen3-asr-offline-cu128.tar.gz`（~15 GB）+ `qwen3-asr-models.tar.gz`（~6.3 GB），合计 ~21 GB。
+### 3.7 打包镜像
 
----
+```bash
+docker save qwen3-asr-offline:cu128-hotfix | gzip > qwen3-asr-offline-cu128-hotfix.tar.gz
+```
+
+最终交付物：`qwen3-asr-offline-cu128-hotfix.tar.gz`（~15 GB）+ `qwen3-asr-models.tar.gz`（~6.3 GB），合计 ~21 GB。
+
+> 目标机部署、启动参数（含必加的 `--max-num-batched-tokens 8192`）与故障排查
+> 见 `docs/deployment-guide.md`（部署操作手册）。
 
 ## 4. 阶段二：传输
 

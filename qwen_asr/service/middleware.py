@@ -454,6 +454,25 @@ def _run_diarize(ext: ExtensionState, wav: Any, min_speakers: Optional[int], max
     )
 
 
+def _release_gpu_cache() -> None:
+    """归还 PyTorch 缓存分配器保留的空闲显存块（仅本进程的扩展侧分配）。
+
+    对齐/说话人前向结束后，缓存分配器会把空闲块留在自己手里不归还驱动，
+    ``mem_get_info`` 空闲显存随即永久偏低——调度器准入据此误判"显存不足"，
+    后续任务全部滞留等待队列（首任务成功、后续全卡死的假死锁；缓存的
+    空闲块实际可复用，并非真被占满）。任务收尾（含异常路径）显式
+    ``empty_cache`` 让队首重准入看到真实空闲显存；模型权重等在用块不受
+    影响，vLLM 引擎进程的显存池也不受影响（独立进程独立分配器）。
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # 防御性：释放失败不影响主流程（仅恢复到旧行为）
+        logger.debug("torch.cuda.empty_cache 失败", exc_info=True)
+
+
 def _parse_optional_int(value: Any) -> Optional[int]:
     """解析可选整数字段；空/缺省为 None，非整数抛 ValueError。"""
     if value is None or str(value).strip() == "":
@@ -759,13 +778,19 @@ class TranscriptionsMiddleware:
         async with ext.scheduler.slot(need_mb):
             # 任务内阶段并行：diarization 不依赖 ASR/对齐结果，两线程同时执行；
             # return_exceptions=True 等待双方落定后再抛首个异常，避免孤儿线程
-            results = await asyncio.gather(
-                asyncio.to_thread(
-                    _run_asr_align, ext, wav, context, force_language, loop, cancel_event
-                ),
-                asyncio.to_thread(_run_diarize, ext, wav, min_speakers, max_speakers),
-                return_exceptions=True,
-            )
+            try:
+                results = await asyncio.gather(
+                    asyncio.to_thread(
+                        _run_asr_align, ext, wav, context, force_language, loop, cancel_event
+                    ),
+                    asyncio.to_thread(_run_diarize, ext, wav, min_speakers, max_speakers),
+                    return_exceptions=True,
+                )
+            finally:
+                # 归还缓存分配器保留的空闲显存块：必须在 slot 释放前执行
+                # （slot 退出会立即触发队首重准入，晚于此则下一个排队任务
+                # 仍按偏低的空闲显存误判而继续滞留队列）
+                await asyncio.to_thread(_release_gpu_cache)
         for result in results:
             if isinstance(result, BaseException):
                 raise result

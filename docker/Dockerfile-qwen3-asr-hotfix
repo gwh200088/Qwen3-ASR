@@ -1,4 +1,4 @@
-# 热修复镜像：基于已构建的 qwen3-asr-offline:cu128，仅覆盖两个修复后的源文件，
+# 热修复镜像：基于已构建的 qwen3-asr-offline:cu128，仅覆盖修复后的源文件，
 # 避免完整重打 15GB 镜像。基础镜像需已存在于本地（docker images 可见）。
 #
 # 修复内容（2026-08-20，GPU 实机首跑发现）：
@@ -7,14 +7,19 @@
 #   fix2 serve.py —— vLLM 0.14.0 build_app 末尾的 SageMaker bootstrap 会预建
 #        middleware_stack，随后的 add_middleware 误报 "application has started"；
 #        现改为手动插入 user_middleware 并重建栈（bootstrap 同款手法）。
+#   fix3 middleware.py —— 首个 segment 任务完成后，PyTorch 缓存分配器保留的
+#        空闲显存块不归还驱动，调度器准入误判"显存不足"导致后续任务永久
+#        排队（首任务成功、后续全卡死）；任务收尾（含异常路径）在 slot
+#        释放前 empty_cache 归还空闲块，队首重准入即可看到真实空闲显存。
 #
-# 本机构建（在仓库根目录执行，构建上下文仅需 qwen_asr/ 两个文件）：
+# 本机构建（在仓库根目录执行，构建上下文仅需 qwen_asr/ 三个文件）：
 #   docker build -f docker/Dockerfile-qwen3-asr-hotfix -t qwen3-asr-offline:cu128-hotfix .
 #
-# 目标机构建（免重传 15GB）：把本文件与两个 .py 按相同目录结构放到目标机
-#   /data/patch/{Dockerfile, qwen_asr/cli/serve.py, qwen_asr/inference/...}，
+# 目标机构建（免重传 15GB）：把本文件与三个 .py 按相同目录结构放到目标机
+#   /data/patch/{Dockerfile, qwen_asr/cli/serve.py, qwen_asr/inference/...,
+#   qwen_asr/service/middleware.py}，
 #   cd /data/patch && docker build -t qwen3-asr-offline:cu128-hotfix .
-#   （目标机已有基础镜像 qwen3-asr-offline:cu128，仅需传输 ~100KB 源文件）
+#   （目标机已有基础镜像 qwen3-asr-offline:cu128，仅需传输 ~150KB 源文件）
 FROM qwen3-asr-offline:cu128
 
 # fix1：diarizer 设备搬运兼容 pyannote 4.x（容器内安装路径以 dist-packages 为准，
@@ -26,7 +31,12 @@ COPY qwen_asr/inference/qwen3_speaker_diarizer.py \
 COPY qwen_asr/cli/serve.py \
      /usr/local/lib/python3.10/dist-packages/qwen_asr/cli/serve.py
 
+# fix3：任务收尾归还缓存分配器空闲显存块，修复调度准入假死锁
+COPY qwen_asr/service/middleware.py \
+     /usr/local/lib/python3.10/dist-packages/qwen_asr/service/middleware.py
+
 # 构建期语法校验 + 刷新字节码缓存（防截断文件进镜像；顺带更新 __pycache__）
 RUN python3 -m py_compile \
      /usr/local/lib/python3.10/dist-packages/qwen_asr/inference/qwen3_speaker_diarizer.py \
-     /usr/local/lib/python3.10/dist-packages/qwen_asr/cli/serve.py
+     /usr/local/lib/python3.10/dist-packages/qwen_asr/cli/serve.py \
+     /usr/local/lib/python3.10/dist-packages/qwen_asr/service/middleware.py

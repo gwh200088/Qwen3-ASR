@@ -172,7 +172,9 @@ class SpeakerDiarizer:
             pipeline = Pipeline.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
         if device is not None and hasattr(pipeline, "to"):
-            pipeline.to(device)
+            # pyannote 4.x 的 Pipeline.to() 严格要求 torch.device 实例（传 str 抛
+            # TypeError）；3.x 则两者皆可。统一转 torch.device 兼容两版。
+            pipeline.to(device if isinstance(device, torch.device) else torch.device(device))
 
         return cls(pipeline=pipeline, device=device)
 

@@ -186,9 +186,17 @@ def maybe_inject_gpu_memory_utilization(rest: List[str], ext_args: argparse.Name
 #       app = build_app(args)                                # ← 只接收 args
 #       await init_app_state(engine_client, app.state, args) # ← engine_client 在
 #                                                            #    此刻才注入 state
+#       await serve_http(app, ...)                           # ← 此刻才开始 serve
 # 因此 engine_client 的提取挂点是 init_app_state（其第一个参数即 engine_client），
 # 而非 build_app；middleware 另有 scope["app"].state.engine_client 的请求期
 # 懒解析兜底（三层防御，适配 vLLM 小版本签名差异）。
+#
+# 注意：vLLM 0.14.0 的 build_app 末尾调用 model_hosting_container_standards 的
+# sagemaker.bootstrap(app)，其 load_middlewares 会立即执行
+# ``app.middleware_stack = app.build_middleware_stack()``（重排中间件后主动建栈）。
+# 此后 Starlette 的 add_middleware 见 middleware_stack 已非 None 即抛
+# "Cannot add middleware after an application has started"——但此刻 serve 尚未
+# 开始，属误判；挂载需走 _mount_transcriptions_middleware 的兼容路径。
 # ---------------------------------------------------------------------------
 
 #: build_app 包装期间构造的 ExtensionState 暂存（init_app_state 包装注入 engine_client 用）
@@ -214,6 +222,34 @@ def _register_health_detail(app: Any, ext: Any) -> None:
         app.add_route("/health/detail", _starlette_endpoint, methods=["GET"])
     else:
         logger.warning("当前 app 不支持路由注册，/health/detail 未注册")
+
+
+def _mount_transcriptions_middleware(app: Any, ext: Any) -> None:
+    """挂载 TranscriptionsMiddleware（兼容 vLLM 0.14.0 的 SageMaker bootstrap）。
+
+    vLLM 0.14.0 的 ``build_app`` 末尾调用
+    ``model_hosting_container_standards.sagemaker.bootstrap(app)``，其
+    ``load_middlewares`` 会主动执行
+    ``app.middleware_stack = app.build_middleware_stack()``（重排为
+    throttle → 引擎中间件 → pre_post_process 后立即建栈）。此后 Starlette 的
+    ``add_middleware`` 见 middleware_stack 已非 None 即抛
+    ``"Cannot add middleware after an application has started"``——但此刻
+    serve 尚未开始（serve_http 在 build_app 返回之后才调用），属误判。
+
+    兼容策略：优先走标准 ``add_middleware``；抛 RuntimeError 时改为手动等价
+    操作——在 user_middleware 头部插入（与 add_middleware 的 ``insert(0, ...)``
+    语义一致，位于最外层）并重建 middleware_stack（与 bootstrap 自身重建手法
+    相同，此时未开始 serve，安全）。
+    """
+    try:
+        app.add_middleware(TranscriptionsMiddleware, ext=ext)
+        return
+    except RuntimeError as exc:
+        logger.info(f"add_middleware 被拒（{exc}），改用手动插入 + 重建中间件栈兼容路径")
+    from starlette.middleware import Middleware
+
+    app.user_middleware.insert(0, Middleware(TranscriptionsMiddleware, ext=ext))
+    app.middleware_stack = app.build_middleware_stack()
 
 
 def _install_init_app_state_hook(api_server: Any) -> None:
@@ -256,7 +292,8 @@ def install_build_app_hook(
 
     包装逻辑：原样调用原函数取回 app → ``load_extensions``（此时 vLLM 引擎已
     初始化、显存已占；扩展加载后执行启动校验，失败即抛 RuntimeError 终止启动）
-    → ``app.add_middleware(TranscriptionsMiddleware, ext=ext)`` → 注册
+    → ``_mount_transcriptions_middleware``（标准 add_middleware 优先，被
+    SageMaker bootstrap 预建栈拒绝时手动插入并重建栈）→ 注册
     ``/health/detail`` → 返回 app。engine_client 不在此提取（时序上尚不可得），
     由 init_app_state 钩子或 middleware 请求期懒解析注入。
 
@@ -291,7 +328,7 @@ def install_build_app_hook(
                 f"qwen-asr-serve 扩展模型加载/显存启动校验失败，服务终止启动: {exc}"
             ) from exc
         _pending_exts.append(ext)
-        app.add_middleware(TranscriptionsMiddleware, ext=ext)
+        _mount_transcriptions_middleware(app, ext)
         _register_health_detail(app, ext)
         logger.info(
             "qwen-asr-serve 扩展就绪：TranscriptionsMiddleware 已挂载，/health/detail 已注册"

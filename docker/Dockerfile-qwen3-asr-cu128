@@ -2,7 +2,7 @@
 
 ARG CUDA_VERSION=12.8.0
 ARG from=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
-FROM ${from} as base
+FROM ${from} AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
 

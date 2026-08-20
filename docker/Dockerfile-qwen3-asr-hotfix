@@ -1,0 +1,32 @@
+# 热修复镜像：基于已构建的 qwen3-asr-offline:cu128，仅覆盖两个修复后的源文件，
+# 避免完整重打 15GB 镜像。基础镜像需已存在于本地（docker images 可见）。
+#
+# 修复内容（2026-08-20，GPU 实机首跑发现）：
+#   fix1 qwen3_speaker_diarizer.py —— pyannote.audio 4.x Pipeline.to() 严格要求
+#        torch.device 实例，传 str 抛 TypeError（3.x 两者皆可）；现统一转换。
+#   fix2 serve.py —— vLLM 0.14.0 build_app 末尾的 SageMaker bootstrap 会预建
+#        middleware_stack，随后的 add_middleware 误报 "application has started"；
+#        现改为手动插入 user_middleware 并重建栈（bootstrap 同款手法）。
+#
+# 本机构建（在仓库根目录执行，构建上下文仅需 qwen_asr/ 两个文件）：
+#   docker build -f docker/Dockerfile-qwen3-asr-hotfix -t qwen3-asr-offline:cu128-hotfix .
+#
+# 目标机构建（免重传 15GB）：把本文件与两个 .py 按相同目录结构放到目标机
+#   /data/patch/{Dockerfile, qwen_asr/cli/serve.py, qwen_asr/inference/...}，
+#   cd /data/patch && docker build -t qwen3-asr-offline:cu128-hotfix .
+#   （目标机已有基础镜像 qwen3-asr-offline:cu128，仅需传输 ~100KB 源文件）
+FROM qwen3-asr-offline:cu128
+
+# fix1：diarizer 设备搬运兼容 pyannote 4.x（容器内安装路径以 dist-packages 为准，
+# 与目标机报错堆栈中的路径一致）
+COPY qwen_asr/inference/qwen3_speaker_diarizer.py \
+     /usr/local/lib/python3.10/dist-packages/qwen_asr/inference/qwen3_speaker_diarizer.py
+
+# fix2：中间件挂载兼容 vLLM 0.14.0 SageMaker bootstrap 预建栈
+COPY qwen_asr/cli/serve.py \
+     /usr/local/lib/python3.10/dist-packages/qwen_asr/cli/serve.py
+
+# 构建期语法校验 + 刷新字节码缓存（防截断文件进镜像；顺带更新 __pycache__）
+RUN python3 -m py_compile \
+     /usr/local/lib/python3.10/dist-packages/qwen_asr/inference/qwen3_speaker_diarizer.py \
+     /usr/local/lib/python3.10/dist-packages/qwen_asr/cli/serve.py

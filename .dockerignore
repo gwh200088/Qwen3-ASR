@@ -8,6 +8,7 @@ Qwen3-ASR-*/
 Qwen3-ForcedAligner-*/
 hf-cache/
 *.tar.gz
+*.tar
 *.safetensors
 *.bin
 *.pth

@@ -273,6 +273,71 @@ docker run -d --name qwen3-asr --restart unless-stopped \
   ... --aligner-device cuda:1 --diarizer-device cuda:2 ...
 ```
 
+**四卡（ASR 双卡张量并行 + 对齐/说话人各独占一卡，吞吐最高）：**
+
+```bash
+docker run -d --name qwen3-asr --restart unless-stopped \
+  --gpus '"device=0,1,2,3"' --shm-size 8g -p 8000:80 \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
+  -e OMP_NUM_THREADS=8 \
+  -v /data/models:/models:ro \
+  qwen3-asr-offline:cu128-hotfix \
+  qwen-asr-serve /models/Qwen3-ASR-1.7B --served-model-name qwen3-asr \
+    --host 0.0.0.0 --port 80 \
+    --tensor-parallel-size 2 \
+    --forced-aligner /models/Qwen3-ForcedAligner-0.6B \
+    --diarizer /models/pyannote-speaker-diarization-community-1 \
+    --aligner-device cuda:2 --diarizer-device cuda:3 \
+    --max-num-batched-tokens 8192
+```
+
+要点：
+
+- GPU 0/1：vLLM 张量并行跑 ASR（权重/KV cache 各占 ~21.6GB@0.90，KV cache 容量翻倍）。注意 **`--api-server-count > 1` 不受支持**（启动即拒绝），ASR 扩容只能走张量并行
+- GPU 2：aligner 独占；GPU 3：diarizer 独占——扩展不在 vLLM 卡上，**无需传 `--gpu-memory-utilization`**（自动注入 0.70 仅在扩展与 vLLM 同卡时触发，此时 vLLM 用满默认 0.90）
+- 调度器按设备独立准入，对齐/说话人互不挤占；此拓扑下建议实测后将 `--max-concurrent-tasks` 提到 3~4（同组件跨任务因进程级锁仍串行，收益递减）
+- `OMP_NUM_THREADS` 取核数 1/4 左右（32 核给 8），防多任务 VBx 聚类抢空 CPU 饿死引擎
+- A10 间无 NVLink 时张量并行走 PCIe 有通信开销；1.7B 模型 TP=2 的收益主要在 KV cache 翻倍（并发吞吐），建议实测对比单/双卡吞吐后再定
+
+**四卡全 T4（16GB）变体：**
+
+```bash
+  --gpus '"device=0,1,2,3"' \
+  ... qwen-asr-serve /models/Qwen3-ASR-1.7B ... \
+    --tensor-parallel-size 2 --dtype float16 \
+    --aligner-device cuda:2 --diarizer-device cuda:3 \
+    --max-num-batched-tokens 8192
+```
+
+与 A10 四卡的差异：
+
+- **必须加 `--dtype float16`**：T4 为 Turing 架构（SM 7.5），不支持 bfloat16；Qwen3-ASR-1.7B 权重为 bf16，不显式指定时 vLLM 虽会自动降 fp16 并打 warning，显式声明可避免歧义
+- vLLM 两张 T4 各占 0.90 × 16GB ≈ 14.4GB（fp16 权重 ~3.5GB，KV cache 空间充足），无需传 `--gpu-memory-utilization`；单卡拓扑的 0.55 不适用于此分离拓扑
+- GPU 2/3 独占 16GB 跑 aligner/diarizer 绰绰有余（常驻 + 瞬态合计 <3GB），准入校验宽松
+- T4 算力约为 A10 一半（fp16 ~65 vs ~125 TFLOPS），且无 NVLink，TP=2 的 PCIe 通信开销占比更大；1 小时音频端到端耗时约为 A10 单卡的 1.5~2 倍，`speakerSummary` 等结果不受影响
+- 若实测 TP=2 通信开销过大，可退化为「T4×1 跑 ASR（gmu 0.55 同卡扩展）+ 其余三卡另部署实例」的分片方案（按请求分流的水平扩展）
+
+**旧版 Docker（<19.03，无 `--gpus`）GPU 参数兼容：**
+
+`--gpus` 由 Docker 19.03 引入。目标机 Docker 低于 19.03（如 18.09）时，用 nvidia-docker2 时代的等价写法——把 `--gpus '"device=0,1,2,3"'` 替换为：
+
+```bash
+  --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
+```
+
+- `NVIDIA_VISIBLE_DEVICES` 按 nvidia-smi 顺序编号，容器内映射为 cuda:0~3，`--aligner-device` 等参数无需改动
+- 前置：`docker info | grep -i runtimes` 应含 `nvidia`；缺失时确认 `nvidia-container-runtime` 二进制存在，并在 `/etc/docker/daemon.json` 注册：
+
+```json
+{ "runtimes": { "nvidia": { "path": "nvidia-container-runtime", "runtimeArgs": [] } } }
+```
+
+  后 `systemctl restart docker`
+- 验证（离线可用）：`docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 qwen3-asr-offline:cu128-hotfix nvidia-smi` 应列出全部目标卡
+- 注意：若 Docker ≥19.03 报 `could not select device driver "" with capabilities: [[gpu]]`，是**未装 nvidia-container-toolkit** 而非版本不支持，安装后继续用 `--gpus` 即可
+- `docker load` 加载本镜像 tar 在 18.x 上兼容（save/load 格式早已定型），不受影响
+
 ### 6.7 关闭扩展功能（纯 vLLM 模式）
 
 ```bash

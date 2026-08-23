@@ -127,7 +127,12 @@ def build_extension_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-reserve-mb", type=int, default=1024, help="每设备显存安全余量（MB）")
     parser.add_argument("--max-audio-seconds", type=float, default=3600.0, help="音频时长上限（秒）")
     parser.add_argument("--max-audio-bytes", type=int, default=500 * 1024 * 1024, help="音频体积上限（字节，默认 500MB）")
-    parser.add_argument("--segment-gap-threshold", type=float, default=0.8, help="segment 切分时间间隙阈值（秒）")
+    parser.add_argument(
+        "--segment-gap-threshold",
+        type=float,
+        default=2.0,
+        help="相邻词之间无句末标点时触发切分的静音间隙阈值（秒）；句末标点处恒切分",
+    )
     parser.add_argument("--max-segment-seconds", type=float, default=30.0, help="segment 最大段长（秒）")
     parser.add_argument("--align-batch-size", type=int, default=4, help="对齐批大小（亦为标准模式 ASR 并发上限）")
     parser.add_argument(
@@ -142,6 +147,13 @@ def build_extension_parser() -> argparse.ArgumentParser:
         type=_non_negative_float,
         default=2.0,
         help="word 模式同人相邻段合并阈值（秒，默认 2.0；0 表示不合并；仅 word 模式生效）",
+    )
+    parser.add_argument(
+        "--punctuation-split",
+        choices=["on", "off"],
+        default="on",
+        help="句末标点硬切分开关（默认 on；off 为纯间隙切分，完整旧行为回退组合为 "
+        "off + --segment-gap-threshold 0.8）",
     )
     return parser
 

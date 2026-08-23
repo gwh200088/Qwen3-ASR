@@ -857,5 +857,6 @@ class TranscriptionsMiddleware:
             speaker_attribution=str(ext.speaker_attribution or "word"),
             speaker_merge_gap=float(ext.speaker_merge_gap),
             coarse_chunks=coarse_chunks,
+            punctuation_split=bool(ext.punctuation_split),
         )
         await _send_json(send, 200, response)

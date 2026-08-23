@@ -70,6 +70,8 @@ class ExtensionState:
         segment_gap_threshold / max_segment_seconds: segment 切分参数。
         speaker_attribution / speaker_merge_gap: 说话人归属模式（word 词级归属 /
             segment 段级投票）与 word 模式同人相邻段合并阈值（秒，<=0 不合并）。
+        punctuation_split: 句末标点硬切分开关（True 恒切分 + 标点附前段末尾；
+            False 纯间隙切分）。
         max_audio_seconds / max_audio_bytes: 音频时长（秒）与体积（字节）上限。
         align_batch_size: 对齐批大小（亦是标准模式 ASR 并发信号量上限）。
         served_model_names: 已加载模型名列表；空列表表示不做 model 名校验。
@@ -85,10 +87,11 @@ class ExtensionState:
 
     aligner_device: str = "cpu"
     diarizer_device: str = "cpu"
-    segment_gap_threshold: float = 0.8
+    segment_gap_threshold: float = 2.0
     max_segment_seconds: float = 30.0
     speaker_attribution: str = "word"
     speaker_merge_gap: float = 2.0
+    punctuation_split: bool = True
     max_audio_seconds: float = 3600.0
     max_audio_bytes: int = 500 * 1024 * 1024
     align_batch_size: int = 4
@@ -230,7 +233,7 @@ def load_extensions(
             pyannote_token / aligner_device / diarizer_device / max_concurrent_tasks /
             gpu_reserve_mb / max_audio_seconds / max_audio_bytes /
             segment_gap_threshold / max_segment_seconds / align_batch_size /
-            speaker_attribution / speaker_merge_gap）。
+            speaker_attribution / speaker_merge_gap / punctuation_split）。
         model_path: vLLM --model 值，用于加载 Qwen3ASRProcessor（CPU 常驻）。
         served_model_names: 已加载模型名列表（缺省空列表表示不校验）。
 
@@ -308,10 +311,11 @@ def load_extensions(
         scheduler=scheduler,
         aligner_device=aligner_device,
         diarizer_device=diarizer_device,
-        segment_gap_threshold=float(getattr(ext_args, "segment_gap_threshold", 0.8) or 0.8),
+        segment_gap_threshold=float(getattr(ext_args, "segment_gap_threshold", 2.0) or 2.0),
         max_segment_seconds=float(getattr(ext_args, "max_segment_seconds", 30.0) or 30.0),
         speaker_attribution=str(getattr(ext_args, "speaker_attribution", "word") or "word"),
         speaker_merge_gap=speaker_merge_gap,
+        punctuation_split=str(getattr(ext_args, "punctuation_split", "on") or "on") == "on",
         max_audio_seconds=float(getattr(ext_args, "max_audio_seconds", 3600.0) or 3600.0),
         max_audio_bytes=int(getattr(ext_args, "max_audio_bytes", 500 * 1024 * 1024) or 500 * 1024 * 1024),
         align_batch_size=align_batch,

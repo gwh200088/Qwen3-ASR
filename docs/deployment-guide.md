@@ -193,6 +193,8 @@ docker run -d --name qwen3-asr --restart unless-stopped \
 | `--segment-gap-threshold` | `0.8` | segment 切分时间间隙阈值（秒） |
 | `--max-segment-seconds` | `30.0` | segment 最大段长（秒） |
 | `--align-batch-size` | `4` | 对齐批大小（亦为标准模式 ASR 并发上限） |
+| `--speaker-attribution` | `word` | 说话人归属模式：`word`（默认，词中点投票归属 + 说话人变化切分 + 同人二次聚合）/ `segment`（段级重叠投票，升级前行为）。两种模式下逐块对齐容错与粗段兜底均生效 |
+| `--speaker-merge-gap` | `2.0` | word 模式同人相邻段合并阈值（秒）：自然停顿 < 该值且间隙无他人插话时合并为一段；`0` 表示不合并；负值启动报错；仅 word 模式生效 |
 
 **位置参数**：`qwen-asr-serve <model_path>` 为 ASR 主模型路径（必须是 argv 中首个非 flag 参数，或用 `--model` 显式指定）。
 
@@ -500,11 +502,39 @@ docker exec qwen3-asr python3 /data/shared/Qwen3-ASR/examples/example_segment_ap
 | `text` | 完整转写文本 |
 | `processTime` | 服务端处理耗时（秒） |
 | `segments[].start/end` | 段级时间戳（秒，强制对齐产出，按 start 升序） |
-| `segments[].speaker` | 该段**主导说话人**（一段内多人时取说话时间占比最多者；无法判定时为 `null`） |
-| `segments[].speakers` | 该段出现过的全部说话人列表 |
+| `segments[].speaker` | 该段**主导说话人**；口径随归属模式不同（见下表），无法判定时为 `null` |
+| `segments[].speakers` | 该段出现过的说话人列表；口径随归属模式不同（见下表），结构均为字符串数组 |
 | `speakerSummary.speakerCount` | 识别出的说话人总数 |
 | `speakerSummary.speakers[].totalDuration` | 该说话人累计发言时长（秒）；`speaker=null` 的段时长不归属任何人，ΣtotalDuration 可能 < duration |
 | `speakerSummary.speakers[].segmentCount` | 该说话人的主导段数 |
+
+#### 8.3.1 说话人归属双模式（`--speaker-attribution`）
+
+`speaker` / `speakers` 两字段在两种归属模式下**统计口径不同**（结构兼容，语义有差异）：
+
+| 字段 | `word` 模式（默认） | `segment` 模式 |
+|---|---|---|
+| `segments[].speaker` | 段内**词归属**的 speaker（word 模式按词归属切分，段内理论全同人；洞插值边界情况下取词数最多者，并列取 id 字典序最小者） | 段区间与 diarization 片段重叠时长最大的说话人（段级投票） |
+| `segments[].speakers` | 段内**词归属**出现过的 speaker 去重集合（按词数降序、id 升序） | 段区间重叠 ≥ 0.1s 的说话人（升级前行为不变） |
+
+**word 模式行为变化**（相对 segment 模式）：
+
+- **快速交锋正确切分**：两人换人间隙 < 0.8s（切分阈值）时，旧版会把两人合进同一 segment 并整段归给主导者；word 模式按词归属在说话人变化点切分，A 的词归 A、B 的词归 B，`totalDuration` 精度提升到词粒度；
+- **同人自然停顿聚合**：同一人停顿 ≥ 0.8s 触发间隙切分后，若停顿 < `--speaker-merge-gap`（默认 2.0s）且间隙内无其他说话人的 diarization 片段（短插话保护，阈值 0.3s），两段二次聚合为一段；`--speaker-merge-gap 0` 关闭聚合；
+- **洞填充**：词时间中点未落入任何 diarization 片段（漏检/间隙/幻觉词）时按时间邻近性插值推断归属；diarization 整段漏检时该区间 speaker=null；
+- **精度预期**：换人点附近个别词可能错归属——切分精度受 diarization 边界误差（典型 ±0.5s 量级）与重叠语音区词中点投票固有误差限制。word 模式是粒度改进，不承诺词级全对。
+
+**回退到旧行为**：以 `--speaker-attribution segment` 启动即可，归属结果与升级前一致（逐块容错与粗段兜底仍生效，见下节）。
+
+#### 8.3.2 对齐逐块容错与粗段兜底（两种模式均生效）
+
+长音频按 180s 分块对齐，单个对齐块异常（OOM/音频异常等）**不再导致整请求 500**：
+
+- 失败块的文本按块区间产出**粗粒度兜底段**（`start`/`end` 为块区间边界，speaker 按块区间投票，与正常段同构、无区分标记），其余块正常词级归属，日志记录失败块序号与异常摘要；
+- 所有对齐块全部失败但 ASR 文本正常时，每个非空文本块产出一个粗段（而非返回空 segments）；
+- 正常段与粗段混合产出时 `segments[]` 仍按 `start` 全局升序，粗段不与任何段合并；
+- **精度限制**：粗段粒度为 180s 块级，段内无法定位切点；粗段整段时长计入投票主导的 speaker，次要说话人时长被整段吞掉——`totalDuration` 失真幅度大于段级投票，最长可达 180s；
+- **范围**：本容错仅覆盖对齐计算异常；ASR 分块生成异常仍按现状整请求失败（返回 500）。
 
 ### 8.4 错误响应
 
@@ -620,4 +650,5 @@ proxy_send_timeout 900s;
 - **`--max-num-batched-tokens` 下限约束**：必须 ≥ 8192（覆盖 180s 分块的 ~4500 token 单次 prefill），低于该值长音频会触发 §11 #2 的停滞；若未来调大音频分块时长，需同步上调此参数。
 - **同步长响应**：1h 音频高并发时队尾任务等待较久，中间代理超时会切断连接（服务端有断连取消，不白算但客户端拿不到结果）。
 - **`speaker=null` 语义**：无法判定主导说话人的段，其时长不计入任何 speaker 的 totalDuration。
+- **word 归属模式精度上限**：换人点附近个别词可能错归属（受 diarization 边界 ±0.5s 误差限制，见 §8.3.1）；对齐失败块的粗段兜底为 180s 块级粒度，粗段时长整段计入 dominant speaker（见 §8.3.2）。
 - **word 粒度未支持**：`timestamp_granularities[]=word` 返回 400。

@@ -82,6 +82,17 @@ _build_app_hook_installed = False
 # ---------------------------------------------------------------------------
 
 
+def _non_negative_float(value: str) -> float:
+    """argparse type：非负浮点（``--speaker-merge-gap`` 负值启动即报错）。"""
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"须为数值，收到: {value!r}")
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"不能为负数，收到: {value}")
+    return parsed
+
+
 def build_extension_parser() -> argparse.ArgumentParser:
     """扩展参数定义（默认值逐项对应 spec MODIFIED Requirement）。
 
@@ -119,6 +130,19 @@ def build_extension_parser() -> argparse.ArgumentParser:
     parser.add_argument("--segment-gap-threshold", type=float, default=0.8, help="segment 切分时间间隙阈值（秒）")
     parser.add_argument("--max-segment-seconds", type=float, default=30.0, help="segment 最大段长（秒）")
     parser.add_argument("--align-batch-size", type=int, default=4, help="对齐批大小（亦为标准模式 ASR 并发上限）")
+    parser.add_argument(
+        "--speaker-attribution",
+        choices=["word", "segment"],
+        default="word",
+        help="说话人归属模式：word（默认，词中点投票 + 洞填充 + 说话人变化切分 + "
+        "同人二次聚合）/ segment（段级重叠投票，升级前行为）",
+    )
+    parser.add_argument(
+        "--speaker-merge-gap",
+        type=_non_negative_float,
+        default=2.0,
+        help="word 模式同人相邻段合并阈值（秒，默认 2.0；0 表示不合并；仅 word 模式生效）",
+    )
     return parser
 
 

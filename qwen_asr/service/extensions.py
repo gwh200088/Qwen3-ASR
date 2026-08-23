@@ -68,6 +68,8 @@ class ExtensionState:
         aligner_lock: 进程级锁，串行化 aligner 前向（transformers 模型无并发保证）。
         aligner_device / diarizer_device: 规范化设备串（normalize_device 后）。
         segment_gap_threshold / max_segment_seconds: segment 切分参数。
+        speaker_attribution / speaker_merge_gap: 说话人归属模式（word 词级归属 /
+            segment 段级投票）与 word 模式同人相邻段合并阈值（秒，<=0 不合并）。
         max_audio_seconds / max_audio_bytes: 音频时长（秒）与体积（字节）上限。
         align_batch_size: 对齐批大小（亦是标准模式 ASR 并发信号量上限）。
         served_model_names: 已加载模型名列表；空列表表示不做 model 名校验。
@@ -85,6 +87,8 @@ class ExtensionState:
     diarizer_device: str = "cpu"
     segment_gap_threshold: float = 0.8
     max_segment_seconds: float = 30.0
+    speaker_attribution: str = "word"
+    speaker_merge_gap: float = 2.0
     max_audio_seconds: float = 3600.0
     max_audio_bytes: int = 500 * 1024 * 1024
     align_batch_size: int = 4
@@ -225,7 +229,8 @@ def load_extensions(
         ext_args: serve.py 剥离出的扩展参数 Namespace（forced_aligner / diarizer /
             pyannote_token / aligner_device / diarizer_device / max_concurrent_tasks /
             gpu_reserve_mb / max_audio_seconds / max_audio_bytes /
-            segment_gap_threshold / max_segment_seconds / align_batch_size）。
+            segment_gap_threshold / max_segment_seconds / align_batch_size /
+            speaker_attribution / speaker_merge_gap）。
         model_path: vLLM --model 值，用于加载 Qwen3ASRProcessor（CPU 常驻）。
         served_model_names: 已加载模型名列表（缺省空列表表示不校验）。
 
@@ -283,6 +288,9 @@ def load_extensions(
     )
 
     align_batch = int(getattr(ext_args, "align_batch_size", 4) or 4)
+    # merge_gap 显式 0 合法（不合并），不能走 `or 默认值` 的 falsy 回退
+    merge_gap_raw = getattr(ext_args, "speaker_merge_gap", None)
+    speaker_merge_gap = float(merge_gap_raw) if merge_gap_raw is not None else 2.0
 
     # 启动快速失败校验（仅扩展启用时）：按设备最小瞬态需求——
     # max_concurrent_tasks=1、align_batch_size、30s 音频——空闲不足即抛 RuntimeError
@@ -302,6 +310,8 @@ def load_extensions(
         diarizer_device=diarizer_device,
         segment_gap_threshold=float(getattr(ext_args, "segment_gap_threshold", 0.8) or 0.8),
         max_segment_seconds=float(getattr(ext_args, "max_segment_seconds", 30.0) or 30.0),
+        speaker_attribution=str(getattr(ext_args, "speaker_attribution", "word") or "word"),
+        speaker_merge_gap=speaker_merge_gap,
         max_audio_seconds=float(getattr(ext_args, "max_audio_seconds", 3600.0) or 3600.0),
         max_audio_bytes=int(getattr(ext_args, "max_audio_bytes", 500 * 1024 * 1024) or 500 * 1024 * 1024),
         align_batch_size=align_batch,

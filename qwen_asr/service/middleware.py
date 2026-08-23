@@ -27,7 +27,8 @@ ASGI middleware：接管 `POST /v1/audio/transcriptions`（纯 ASGI，零框架�
 - `TranscriptionsMiddleware`：只拦 POST + /v1/audio/transcriptions，其余路径零干预透传；
   - 标准模式（无 segment 粒度）：1200s 分块 ASR（信号量限并发）→ OpenAI 标准响应；
   - segment 模式：调度器排队准入后，ASR+对齐 与 diarization 两阶段线程并行，
-    pipeline 纯函数组装 segment + speakerSummary 响应；
+    pipeline 纯函数组装 segment + speakerSummary 响应；对齐逐块容错——单个
+    batch 异常不拖垮整请求，失败块/全空对齐走块级粗粒度兜底（与归属模式正交）；
   - 排队/执行期间客户端断连：monitor 任务读 receive() 的 http.disconnect 取消主任务
     （scheduler.slot 的取消语义保证排队位/许可清理）。
 """
@@ -385,22 +386,32 @@ def _run_asr_align(
     force_language: Optional[str],
     loop: asyncio.AbstractEventLoop,
     cancel_event: Optional[threading.Event] = None,
-) -> Tuple[str, str, Any]:
-    """segment 模式线程体：180s 分块 ASR（批量提交）→ 批量对齐 → 偏移合并。
+) -> Tuple[str, str, Any, List[Tuple[str, float, float]]]:
+    """segment 模式线程体：180s 分块 ASR（批量提交）→ 批量对齐（逐块容错）→ 偏移合并。
 
     ASR 生成经 ``run_coroutine_threadsafe`` 批量提交回主事件循环后按序收集
     （与 SDK ``_infer_asr_vllm`` 的批量提交方式一致，长音频多块不必逐块串行
     等待）；对齐在进程级锁内按 align_batch_size 批量执行。
     ``cancel_event`` 置位（客户端断连）时在块间/对齐批次间尽快中止后续处理，
-    并对已提交的剩余分块生成调用 ``future.cancel()``（取消会传播到事件循环中
-    的生成协程，在 await 点中断；GPU 上正在执行的引擎侧前向由 vLLM 引擎自行
+    并对已提交的剩余分块生成调用 ``future.cancel()``（取消会传播到事件循环
+    中的生成协程，在 await 点中断；GPU 上正在执行的引擎侧前向由 vLLM 引擎自行
     abort，属 spec 声明的尽力取消）。
-    返回 ``(完整文本, 合并语言, 合并对齐结果或 None)``。
+
+    对齐逐块容错（spec「逐块对齐容错」）：单个对齐 batch 的计算异常不传播为
+    整请求失败——失败 batch 内各块记录 ``(块文本, offset, offset+块长)`` 进
+    粗粒度兜底列表并 ``logger.warning``（块序号 + 异常摘要），继续后续 batch；
+    取消异常不在容错范围（cancel_event 置位时照常中止，不被吞）。对齐结果
+    全空（全块失败或 merge 返回 None）时，兜底列表覆盖全部非空文本块。
+    ASR 分块生成异常（``future.result()`` 抛出）不在容错范围（spec 范围声明），
+    仍按现状整请求失败。
+
+    返回 ``(完整文本, 合并语言, 合并对齐结果或 None, 粗粒度兜底块列表)``。
     """
 
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
 
+    audio_end = len(wav) / float(SAMPLE_RATE)
     chunks = split_audio_into_chunks(wav, SAMPLE_RATE, MAX_FORCE_ALIGN_INPUT_SECONDS)
     # 批量提交全部分块生成请求（engine 内部排队调度），再按序收集结果
     futures = []
@@ -427,22 +438,57 @@ def _run_asr_align(
     full_text = "".join(txt for _, txt, _, _ in per_chunk)
     merged_lang = merge_languages([lang for _, _, lang, _ in per_chunk])
 
+    def _coarse_interval(cwav: Any, offset: float) -> Tuple[float, float]:
+        """失败块的粗粒度兜底区间 ``[offset, offset+块长]``（截断到音频末端）。"""
+        return (offset, min(offset + len(cwav) / float(SAMPLE_RATE), audio_end))
+
     aligned: List[Any] = []
-    batch: List[Tuple[Any, str, str, float]] = []
-    for item in per_chunk:
+    coarse_chunks: List[Tuple[str, float, float]] = []
+    # batch 元素：(块序号, cwav, 文本, 语言, offset)——序号供失败告警定位
+    batch: List[Tuple[int, Any, str, str, float]] = []
+
+    def _flush_align_batch() -> None:
+        nonlocal batch
+        if not batch:
+            return
+        payload = [(cwav, txt, lang, off) for _, cwav, txt, lang, off in batch]
+        try:
+            aligned.extend(_align_batch(ext, payload))
+        except Exception as exc:
+            if _cancelled():
+                # 客户端断连：取消语义优先，不被逐块容错吞掉
+                raise RuntimeError("客户端已断开，中止后续对齐处理") from exc
+            for idx, cwav, txt, _, offset in batch:
+                start, end = _coarse_interval(cwav, offset)
+                coarse_chunks.append((txt, start, end))
+            logger.warning(
+                "对齐 batch 异常，块 %s 走粗粒度兜底: %s",
+                [item[0] for item in batch],
+                exc,
+            )
+        batch = []
+
+    for idx, item in enumerate(per_chunk):
         if _cancelled():
             raise RuntimeError("客户端已断开，中止后续对齐处理")
         if not item[1].strip():
             continue  # 空文本块跳过对齐（与 SDK transcribe 行为一致）
-        batch.append(item)
+        batch.append((idx, *item))
         if len(batch) >= int(ext.align_batch_size):
-            aligned.extend(_align_batch(ext, batch))
-            batch = []
-    if batch:
-        aligned.extend(_align_batch(ext, batch))
+            _flush_align_batch()
+    _flush_align_batch()
 
     merged = merge_align_results([r for r in aligned if r is not None])
-    return full_text, merged_lang, merged
+    if merged is None:
+        # 对齐结果全空（全块失败或逐块均未产出 item）：全部非空文本块整体
+        # 走块级粗粒度兜底（而非返回空 segments；spec「失败块与全空对齐的
+        # 粗粒度兜底」），无有效文本块时兜底列表为空 → segments=[]（与现状一致）
+        coarse_chunks = [
+            (txt, *_coarse_interval(cwav, offset))
+            for (cwav, txt, _, offset) in per_chunk
+            if txt.strip()
+        ]
+    return full_text, merged_lang, merged, coarse_chunks
 
 
 def _run_diarize(ext: ExtensionState, wav: Any, min_speakers: Optional[int], max_speakers: Optional[int]) -> List[Any]:
@@ -795,7 +841,7 @@ class TranscriptionsMiddleware:
             if isinstance(result, BaseException):
                 raise result
 
-        (full_text, language, merged_align), diar_results = results
+        (full_text, language, merged_align, coarse_chunks), diar_results = results
         align_items = list(merged_align.items) if merged_align is not None else []
         diar_segments = diar_results[0].segments if diar_results else []
         process_time = time.perf_counter() - start  # 含排队等待
@@ -808,5 +854,8 @@ class TranscriptionsMiddleware:
             process_time,
             segment_gap_threshold=float(ext.segment_gap_threshold),
             max_segment_seconds=float(ext.max_segment_seconds),
+            speaker_attribution=str(ext.speaker_attribution or "word"),
+            speaker_merge_gap=float(ext.speaker_merge_gap),
+            coarse_chunks=coarse_chunks,
         )
         await _send_json(send, 200, response)

@@ -93,6 +93,20 @@ def _non_negative_float(value: str) -> float:
     return parsed
 
 
+def _clustering_threshold(value: str) -> float:
+    """argparse type：聚类阈值合法区间 ``0 < t < 2``（0 / 2.5 等启动即报错）。"""
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"须为数值，收到: {value!r}")
+    if not (0 < parsed < 2):
+        raise argparse.ArgumentTypeError(
+            f"须在开区间 (0, 2) 内（收到: {value}）；调低更倾向拆分说话人，"
+            "过度调低会过分割一人成多"
+        )
+    return parsed
+
+
 def build_extension_parser() -> argparse.ArgumentParser:
     """扩展参数定义（默认值逐项对应 spec MODIFIED Requirement）。
 
@@ -154,6 +168,49 @@ def build_extension_parser() -> argparse.ArgumentParser:
         default="on",
         help="句末标点硬切分开关（默认 on；off 为纯间隙切分，完整旧行为回退组合为 "
         "off + --segment-gap-threshold 0.8）",
+    )
+    parser.add_argument(
+        "--segment-split-mode",
+        choices=["punctuation", "hybrid"],
+        default=None,
+        help="segment 切分维度模式（缺省 punctuation；仅 --punctuation-split on 生效）："
+        "punctuation（只按句末标点 + 段长兜底切分，静音间隙与句中说话人变化均不切）/ "
+        "hybrid（标点 + 间隙 + 说话人变化三维混合，上一代行为；--segment-gap-threshold "
+        "与 --speaker-merge-gap 仅此模式生效）",
+    )
+    parser.add_argument(
+        "--diarization-min-speakers",
+        type=int,
+        default=None,
+        help="说话人数下限服务级默认（None 不约束；请求级 min_speakers 未传时回退到此值，"
+        "透传 pyannote 聚类约束，缓解相近说话人被合并）",
+    )
+    parser.add_argument(
+        "--diarization-max-speakers",
+        type=int,
+        default=None,
+        help="说话人数上限服务级默认（None 不约束；请求级 max_speakers 未传时回退到此值）",
+    )
+    parser.add_argument(
+        "--diarization-clustering-threshold",
+        type=_clustering_threshold,
+        default=None,
+        help="说话人聚类阈值服务级覆写（合法区间 (0, 2)；None = 管线默认，具体值以部署机"
+        "模型 config.yaml 为准；调低更倾向拆分说话人，过度调低会过分割一人成多）",
+    )
+    parser.add_argument(
+        "--diarizer-embedding",
+        choices=["wespeaker", "campplus"],
+        default="wespeaker",
+        help="diarization 声纹向量化模式：wespeaker（默认，community-1 管线现状）/ "
+        "campplus（中文域 CAM++ 声纹 + 3.1 式 AHC 余弦聚类，缓解中文男声相近被合并；"
+        "需配 --diarizer-embedding-model）",
+    )
+    parser.add_argument(
+        "--diarizer-embedding-model",
+        default=None,
+        help="CAM++ 声纹模型本地目录（--diarizer-embedding campplus 时必填；wespeaker "
+        "模式下传入被忽略并告警）",
     )
     return parser
 

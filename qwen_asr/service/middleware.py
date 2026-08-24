@@ -694,11 +694,18 @@ class TranscriptionsMiddleware:
             language_raw = form.get("language")
             if language_raw not in (None, ""):
                 language_name = resolve_language_name(str(language_raw))
-            min_speakers = _parse_optional_int(form.get("min_speakers"))
-            max_speakers = _parse_optional_int(form.get("max_speakers"))
+            # 说话人数约束逐参数优先：请求级未传时回退服务级默认
+            # （--diarization-min/max-speakers；spec「说话人数约束服务级默认」）
+            req_min = _parse_optional_int(form.get("min_speakers"))
+            req_max = _parse_optional_int(form.get("max_speakers"))
+            min_speakers = req_min if req_min is not None else ext.diarization_min_speakers
+            max_speakers = req_max if req_max is not None else ext.diarization_max_speakers
             if None not in (min_speakers, max_speakers) and min_speakers > max_speakers:
+                src_min = "请求级 min_speakers" if req_min is not None else "服务级默认 --diarization-min-speakers"
+                src_max = "请求级 max_speakers" if req_max is not None else "服务级默认 --diarization-max-speakers"
                 raise ValueError(
-                    f"min_speakers({min_speakers}) 不能大于 max_speakers({max_speakers})"
+                    f"min_speakers({min_speakers}，来自{src_min}) 不能大于 "
+                    f"max_speakers({max_speakers}，来自{src_max})"
                 )
             granularities = list(form.getlist("timestamp_granularities[]")) + list(
                 form.getlist("timestamp_granularities")
@@ -858,5 +865,6 @@ class TranscriptionsMiddleware:
             speaker_merge_gap=float(ext.speaker_merge_gap),
             coarse_chunks=coarse_chunks,
             punctuation_split=bool(ext.punctuation_split),
+            segment_split_mode=str(ext.segment_split_mode or "punctuation"),
         )
         await _send_json(send, 200, response)

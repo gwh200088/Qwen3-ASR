@@ -71,7 +71,22 @@ class ExtensionState:
         speaker_attribution / speaker_merge_gap: 说话人归属模式（word 词级归属 /
             segment 段级投票）与 word 模式同人相邻段合并阈值（秒，<=0 不合并）。
         punctuation_split: 句末标点硬切分开关（True 恒切分 + 标点附前段末尾；
-            False 纯间隙切分）。
+            False 纯间隙切分，segment_split_mode 被忽略）。
+        segment_split_mode: 切分维度模式——punctuation（默认，只按句末标点 +
+            段长兜底，静音间隙与句中说话人变化均不切分）或 hybrid（标点 +
+            间隙 + 说话人变化，上一代行为）；仅 punctuation_split=True 生效，
+            segment_gap_threshold 与 speaker_merge_gap 仅 hybrid 生效。
+        diarization_min_speakers / diarization_max_speakers: 说话人数约束的
+            服务级默认（None 不约束）；请求级 min_speakers/max_speakers
+            form 参数未传时回退到此默认，透传 pyannote 聚类约束。
+        diarization_clustering_threshold: 说话人聚类阈值服务级覆写（None =
+            管线默认，具体值以部署机模型 config.yaml 为准；调低更倾向拆分
+            说话人，过度调低会过分割一人成多）。
+        diarizer_embedding: diarization 声纹向量化模式——wespeaker（默认，
+            community-1 管线现状）或 campplus（中文域 CAM++ 声纹 + 3.1 式
+            AHC 余弦聚类，缓解中文男声相近被合并）。
+        diarizer_embedding_model: CAM++ 声纹模型本地目录（campplus 模式
+            必填；wespeaker 模式下传入被忽略并告警）。
         max_audio_seconds / max_audio_bytes: 音频时长（秒）与体积（字节）上限。
         align_batch_size: 对齐批大小（亦是标准模式 ASR 并发信号量上限）。
         served_model_names: 已加载模型名列表；空列表表示不做 model 名校验。
@@ -92,6 +107,12 @@ class ExtensionState:
     speaker_attribution: str = "word"
     speaker_merge_gap: float = 2.0
     punctuation_split: bool = True
+    segment_split_mode: str = "punctuation"
+    diarization_min_speakers: Optional[int] = None
+    diarization_max_speakers: Optional[int] = None
+    diarization_clustering_threshold: Optional[float] = None
+    diarizer_embedding: str = "wespeaker"
+    diarizer_embedding_model: Optional[str] = None
     max_audio_seconds: float = 3600.0
     max_audio_bytes: int = 500 * 1024 * 1024
     align_batch_size: int = 4
@@ -203,11 +224,22 @@ def _load_aligner(name: str, device: str) -> Any:
         return aligner
 
 
-def _load_diarizer(name: str, device: str, token: Optional[str]) -> Any:
+def _load_diarizer(
+    name: str,
+    device: str,
+    token: Optional[str],
+    embedding: str = "wespeaker",
+    embedding_model: Optional[str] = None,
+) -> Any:
     """加载 pyannote 说话人识别管线（token 优先级：入参 > PYANNOTE_API_TOKEN > HF_TOKEN）。
 
     SpeakerDiarizer.from_pretrained 内部以 token= 传参并设置 HF_TOKEN 环境变量
-    双保险，且自带 pipeline.to(device) 搬移，此处直接透传设备即可。
+    双保险，且自带 pipeline.to(device) 搬移（campplus 模式下 CAM++ 组件随其后
+    显式搬移），此处直接透传设备与 embedding 模式即可。
+
+    embedding="campplus" 时加载后组件替换注入 CAM++ 中文声纹 + 3.1 式 AHC
+    聚类（生效机制与模型维度由 SpeakerDiarizer 内 INFO 日志输出；模型目录
+    缺失/注入失败 → 中文 RuntimeError，不静默回退）。
     """
     from ..inference.qwen3_speaker_diarizer import SpeakerDiarizer
 
@@ -218,6 +250,8 @@ def _load_diarizer(name: str, device: str, token: Optional[str]) -> Any:
         name,
         use_auth_token=token if token else None,
         device=device if device else None,
+        embedding=embedding,
+        embedding_model=embedding_model,
     )
 
 
@@ -233,7 +267,10 @@ def load_extensions(
             pyannote_token / aligner_device / diarizer_device / max_concurrent_tasks /
             gpu_reserve_mb / max_audio_seconds / max_audio_bytes /
             segment_gap_threshold / max_segment_seconds / align_batch_size /
-            speaker_attribution / speaker_merge_gap / punctuation_split）。
+            speaker_attribution / speaker_merge_gap / punctuation_split /
+            segment_split_mode / diarization_min_speakers /
+            diarization_max_speakers / diarization_clustering_threshold /
+            diarizer_embedding / diarizer_embedding_model）。
         model_path: vLLM --model 值，用于加载 Qwen3ASRProcessor（CPU 常驻）。
         served_model_names: 已加载模型名列表（缺省空列表表示不校验）。
 
@@ -275,14 +312,134 @@ def load_extensions(
     else:
         logger.info("对齐扩展已显式禁用（--forced-aligner 空串），不加载")
 
+    # ---- 新增服务级参数解析 + 组合校验/告警（spec「segment 切分维度模式」
+    # 「说话人数约束服务级默认」「聚类阈值服务级覆写」「CAM++ 集成」）----------
+    # embedding 模式解析须在 diarizer 加载之前（campplus 参数透传加载路径）
+    diarizer_embedding = str(getattr(ext_args, "diarizer_embedding", "wespeaker") or "wespeaker")
+    diarizer_embedding_model = str(
+        getattr(ext_args, "diarizer_embedding_model", "") or ""
+    ).strip() or None
+    if diarizer_embedding == "campplus":
+        if not diarizer_name:
+            # diarizer 整体禁用：embedding 参数无效果（diarization 关闭语义不变）
+            logger.warning(
+                "--diarizer-embedding campplus 与 --diarizer 显式禁用组合："
+                "diarization 整体关闭，embedding 相关参数（含 --diarizer-embedding-model）"
+                "无效果，按现状语义启动。"
+            )
+        elif not diarizer_embedding_model:
+            raise RuntimeError(
+                "--diarizer-embedding campplus 必须提供 --diarizer-embedding-model "
+                "<目录>（CAM++ 声纹模型，如 speech_campplus_sv_zh-cn_16k-common 的本地"
+                "路径）；回退上一代行为请改用 --diarizer-embedding wespeaker。"
+            )
+    elif diarizer_embedding_model:
+        # wespeaker 模式传了模型目录：忽略 + WARNING
+        logger.warning(
+            "--diarizer-embedding wespeaker 模式下 --diarizer-embedding-model %s "
+            "被忽略（该参数仅 campplus 模式生效），按 community-1 管线现状运行。",
+            diarizer_embedding_model,
+        )
+        diarizer_embedding_model = None
+
     diarizer = None
     if diarizer_name:
-        logger.info("加载说话人识别扩展: %s -> %s", diarizer_name, diarizer_device)
+        logger.info(
+            "加载说话人识别扩展: %s -> %s（embedding=%s）",
+            diarizer_name,
+            diarizer_device,
+            diarizer_embedding,
+        )
         diarizer = _load_diarizer(
-            diarizer_name, diarizer_device, getattr(ext_args, "pyannote_token", None)
+            diarizer_name,
+            diarizer_device,
+            getattr(ext_args, "pyannote_token", None),
+            embedding=diarizer_embedding,
+            embedding_model=diarizer_embedding_model,
         )
     else:
         logger.info("说话人识别扩展已显式禁用（--diarizer 空串），不加载")
+
+    # segment_split_mode：None = 未显式传入 → 缺省 punctuation；
+    # --punctuation-split off 时 mode 恒被忽略（纯间隙行为），无论是否显式
+    # 传入 mode 均输出 WARNING（spec「punctuation-split off 组合告警」字面语义）
+    split_mode_raw = getattr(ext_args, "segment_split_mode", None)
+    segment_split_mode = str(split_mode_raw or "punctuation")
+    punctuation_split = str(getattr(ext_args, "punctuation_split", "on") or "on") == "on"
+    if not punctuation_split:
+        logger.warning(
+            "--punctuation-split off 时 segment 切分为纯间隙/段长（word 模式含说话人"
+            "变化）行为，--segment-split-mode %s 被忽略；如需标点+间隙+说话人三维混合"
+            "请改为 --punctuation-split on --segment-split-mode hybrid。",
+            segment_split_mode,
+        )
+
+    # 说话人数约束服务级默认：非法组合启动即失败（fast fail，不区分 diarizer 状态）
+    diar_min_raw = getattr(ext_args, "diarization_min_speakers", None)
+    diar_max_raw = getattr(ext_args, "diarization_max_speakers", None)
+    diarization_min_speakers = int(diar_min_raw) if diar_min_raw is not None else None
+    diarization_max_speakers = int(diar_max_raw) if diar_max_raw is not None else None
+    for label, value in (
+        ("--diarization-min-speakers", diarization_min_speakers),
+        ("--diarization-max-speakers", diarization_max_speakers),
+    ):
+        if value is not None and value < 1:
+            raise RuntimeError(
+                f"{label} 须为不小于 1 的整数（收到: {value}）；"
+                "说话人数约束无意义，请修正后重启"
+            )
+    if (
+        diarization_min_speakers is not None
+        and diarization_max_speakers is not None
+        and diarization_min_speakers > diarization_max_speakers
+    ):
+        raise RuntimeError(
+            f"--diarization-min-speakers ({diarization_min_speakers}) 大于 "
+            f"--diarization-max-speakers ({diarization_max_speakers})，"
+            "约束自相矛盾，请修正后重启"
+        )
+
+    # 聚类阈值：argparse 已校验区间 (0, 2)，此处仅透传（应用在 diarizer 加载后
+    # 防御式探测，见 qwen3_speaker_diarizer）
+    diarization_clustering_threshold = getattr(ext_args, "diarization_clustering_threshold", None)
+    if diarization_clustering_threshold is not None:
+        diarization_clustering_threshold = float(diarization_clustering_threshold)
+
+    # diarizer 禁用时说话人调优参数无效果（告警但不阻断，比照 embedding 先例）
+    if not diarizer_name:
+        ineffective = [
+            flag
+            for flag, value in (
+                ("--diarization-min-speakers", diarization_min_speakers),
+                ("--diarization-max-speakers", diarization_max_speakers),
+                ("--diarization-clustering-threshold", diarization_clustering_threshold),
+            )
+            if value is not None
+        ]
+        if ineffective:
+            logger.warning(
+                "--diarizer 显式禁用时 %s 无效果（diarization 整体关闭），按现状语义启动。",
+                " / ".join(ineffective),
+            )
+
+    # 聚类阈值防御式应用（diarizer 加载后 best-effort，全部机制不可用则 WARNING
+    # 后正常启动——spec「聚类阈值服务级覆写」：AHC 路径 instantiate 为预期主机制）
+    if diarization_clustering_threshold is not None and diarizer is not None:
+        mechanism = diarizer.apply_clustering_threshold(diarization_clustering_threshold)
+        if mechanism:
+            logger.info(
+                "说话人聚类阈值已覆写为 %s（生效机制: %s；调低更倾向拆分说话人，"
+                "过度调低会过分割一人成多）",
+                diarization_clustering_threshold,
+                mechanism,
+            )
+        else:
+            logger.warning(
+                "聚类阈值 %s 应用失败：当前管线不支持任一探测机制"
+                "（instantiate 超参 / clustering_threshold 属性 / 嵌套超参覆写），"
+                "将按管线默认阈值运行（具体默认值以部署机模型 config.yaml 为准）。",
+                diarization_clustering_threshold,
+            )
 
     scheduler = GpuScheduler(
         max_concurrent_tasks=int(getattr(ext_args, "max_concurrent_tasks", 2) or 2),
@@ -315,7 +472,13 @@ def load_extensions(
         max_segment_seconds=float(getattr(ext_args, "max_segment_seconds", 30.0) or 30.0),
         speaker_attribution=str(getattr(ext_args, "speaker_attribution", "word") or "word"),
         speaker_merge_gap=speaker_merge_gap,
-        punctuation_split=str(getattr(ext_args, "punctuation_split", "on") or "on") == "on",
+        punctuation_split=punctuation_split,
+        segment_split_mode=segment_split_mode,
+        diarization_min_speakers=diarization_min_speakers,
+        diarization_max_speakers=diarization_max_speakers,
+        diarization_clustering_threshold=diarization_clustering_threshold,
+        diarizer_embedding=diarizer_embedding,
+        diarizer_embedding_model=diarizer_embedding_model,
         max_audio_seconds=float(getattr(ext_args, "max_audio_seconds", 3600.0) or 3600.0),
         max_audio_bytes=int(getattr(ext_args, "max_audio_bytes", 500 * 1024 * 1024) or 500 * 1024 * 1024),
         align_batch_size=align_batch,

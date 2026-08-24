@@ -19,8 +19,10 @@ Segment 转写管道纯逻辑（零 GPU 依赖，仅标准库）。
 职责（对应 spec「Segment 切分与说话人归属」与「词级说话人归属」）：
 
 - 语言名 ↔ BCP-47 风格码双向映射（30 项，逐项照抄 spec 表格）；
-- 对齐 token 序列 → 句级 segment 切分（句末标点硬边界恒切分 / 无标点处
-  时间间隙阈值 / 段长上限强制切分，spec「标点感知 Segment 切分」）；
+- 对齐 token 序列 → 句级 segment 切分（切分维度模式 spec「segment 切分
+  维度模式」：``punctuation``（默认）只按句末标点硬边界 + 段长上限切分，
+  静音间隙与句中说话人变化均不切分；``hybrid`` 为标点 + 间隙 + 说话人
+  变化的上一代混合行为；跨失败块边界恒切分——遗留 ❶ 修复）；
 - 段文本游标匹配：从完整 ASR 文本截取（保留标点与空格），失败回退拼接；
   句末标点硬边界处切分时，between-span 中的句末标点附前段 ``text`` 末尾
   （含末段尾部追加），客户端拼接 ``segments[].text`` 与 ``text`` 标点无损；
@@ -514,15 +516,22 @@ def _sentence_end_boundaries(
     - 含任一句末标点 → ``boundaries[i] = True``（硬边界，无视间隙恒切分），
       ``puncts[i]`` 为 between-span 中全部句末标点字符按出现顺序拼接
       （如 ``"。"``, ``"？！"``；空格 / 引号等非句末标点字符不收集）；
-    - 不含 → ``boundaries[i] = False``，``puncts[i] = ""``。
+    - 不含 → ``boundaries[i] = False``，``puncts[i] = ""``；
+    - 跨失败块边界恒切分（遗留 ❶ 修复）：边界时间间隙区间与任一 coarse
+      块区间相交 → ``boundaries[i] = True`` **强制切分**且 ``puncts[i] = ""``
+      ——正常段不得横跨失败块，否则 ``_extract_segment_text`` 游标截取
+      ``full_text[首:末]`` 会把 between-span 中的失败块文本截入段文本，
+      与粗段 ``text`` 重复且拼接有损（该问题在 punctuation 模式下触发面
+      为"无标点"即触发——间隙维度关闭，故必须恒切分兜底）。
 
     规则：
 
     - 跨失败块边界 puncts 置空（v3）：边界时间间隙区间 ``[items[i].end,
       items[i+1].start]`` 与任一 coarse 块区间相交（``_gap_blocked`` 同一
-      时间域判定）→ ``puncts[i] = ""``，``boundaries[i]`` 保持原判定、切分
-      照常——该 between-span 含整块失败文本（最长 180s），标点拼入会给
-      前段追加垃圾后缀并与粗段原文标点重复；
+      时间域判定）→ ``puncts[i] = ""``——该 between-span 含整块失败文本
+      （最长 180s），标点拼入会给前段追加垃圾后缀并与粗段原文标点重复；
+      v4 起该边界同时**强制切分**（见上"恒切分"），两者组合保证失败块
+      文本仅计入粗段一次；
     - 任一 item 匹配失败 → 全量回退（全 ``False`` + 全空串）：失败 item
       后游标位置不确定，部分保留已匹配前缀的边界可能使后续 between-span
       错位（标点误判），全量回退语义保守且可预测，不抛异常。
@@ -547,10 +556,15 @@ def _sentence_end_boundaries(
     for i in range(total - 1):
         between = full_text[spans[i][1]:spans[i + 1][0]]
         collected = "".join(ch for ch in between if ch in _SENTENCE_END_CHARS)
-        boundaries.append(bool(collected))
-        if collected and _gap_blocked(items[i][2], items[i + 1][1], coarse_spans):
-            collected = ""  # 跨失败块边界：失败块标点仅保留在粗段原文中
-        puncts.append(collected)
+        if _gap_blocked(items[i][2], items[i + 1][1], coarse_spans):
+            # 跨失败块边界恒切分（遗留 ❶ 修复）：段不横跨失败块，避免游标
+            # 截取把失败块文本截入段文本（与粗段重复）；puncts 置空（v3），
+            # 失败块标点仅保留在粗段原文中
+            boundaries.append(True)
+            puncts.append("")
+        else:
+            boundaries.append(bool(collected))
+            puncts.append(collected)
     return boundaries, puncts, True, spans[-1][1] if spans else -1
 
 
@@ -567,6 +581,7 @@ def build_segment_response(
     speaker_merge_gap: float = 2.0,
     coarse_chunks: Optional[List[Tuple[str, float, float]]] = None,
     punctuation_split: bool = True,
+    segment_split_mode: str = "punctuation",
 ) -> dict:
     """构建 segment 模式响应 dict（纯函数，无副作用）。
 
@@ -577,14 +592,24 @@ def build_segment_response(
     :param language_name: 内部语言名（经 ``language_name_to_code`` 输出码）；
     :param duration: 音频时长（秒）；
     :param process_time: 服务端总耗时（秒），``None`` 则响应中为 ``null``；
+    :param segment_split_mode: 切分维度模式（仅 ``punctuation_split=True``
+        时生效，False 时被忽略）——``punctuation``（默认）只按句末标点
+        硬边界 + 段长上限切分：静音间隙完全不切（阈值视为无穷大）、
+        word 模式句中说话人变化不切分（段 ``speaker`` 取段内词归属投票
+        dominant、``speakers`` 为去重集合）、同人二次聚合跳过；
+        ``hybrid`` 为上一代行为（标点 + 间隙 + word 模式说话人变化切分
+        + 同人二次聚合）。跨失败块边界两模式均恒切分（遗留 ❶ 修复）；
     :param segment_gap_threshold: 相邻 item 之间**无句末标点**时的时间间隙
-        切分阈值（秒，含；默认 2.0）——句末标点处无视间隙恒切分；
-    :param max_segment_seconds: 段长上限（秒，超过强切）；
+        切分阈值（秒，含；默认 2.0）——句末标点处无视间隙恒切分。
+        **仅 ``hybrid`` 模式生效**（punctuation 模式下为无操作参数）；
+    :param max_segment_seconds: 段长上限（秒，超过强切；两模式均生效，
+        punctuation 模式下唯一的非标点切分来源）；
     :param speaker_attribution: 说话人归属模式——``word``（默认，词级归属：
-        词中点投票 + 洞填充 + 说话人变化切分 + 同人二次聚合）或 ``segment``
-        （段级重叠投票，原有行为代码路径零改动）；
+        词中点投票 + 洞填充 + hybrid 模式说话人变化切分 + 同人二次聚合）或
+        ``segment``（段级重叠投票，原有行为代码路径零改动）；
     :param speaker_merge_gap: word 模式同人相邻段合并阈值（秒，默认 2.0；
-        ``<= 0`` 表示不合并；仅 word 模式生效）；
+        ``<= 0`` 表示不合并）。**仅 ``hybrid`` 模式生效**（punctuation
+        模式下同人二次聚合整体跳过，为无操作参数）；
     :param coarse_chunks: 对齐失败块的粗粒度兜底 ``(text, start, end)`` 列表
         （两种归属模式均生效）：每块产出一个块级粗段（块区间投票 + 块 ASR
         原文），与正常段混合产出时 ``segments[]`` 按 ``start`` 全局升序，
@@ -593,7 +618,8 @@ def build_segment_response(
         item 在 ``full_text`` 中匹配区间之间存在句末标点（``。！？；.!?;``
         及换行）的边界恒切分（无视间隙）、切分处句末标点附前段 ``text``
         末尾、末段追加全文尾部句末标点；False 时跳过硬边界计算，纯间隙/
-        段长（word 模式含说话人变化）切分，段文本截取行为不变。
+        段长（word 模式含说话人变化）切分（``segment_split_mode`` 被忽略，
+        由 serve 启动校验输出组合告警），段文本截取行为不变。
     """
     turns = _to_turns(diarization)
     items = [
@@ -606,13 +632,21 @@ def build_segment_response(
     ]
 
     # 句末标点硬边界（spec「标点感知 Segment 切分」）：False 时跳过计算
-    # （boundaries=None，纯间隙行为）；匹配失败全量回退（全 False，无追加）
+    # （boundaries=None，纯间隙行为，segment_split_mode 被忽略）；匹配失败
+    # 全量回退（全 False，无追加）；跨失败块边界恒 True（遗留 ❶ 修复）
     if punctuation_split:
         hard_boundaries, puncts, matched, last_end = _sentence_end_boundaries(
             items, full_text, coarse_spans=[(start, end) for _, start, end in coarse]
         )
     else:
         hard_boundaries, puncts, matched, last_end = None, [], False, -1
+
+    # 切分维度模式（spec「segment 切分维度模式」）：punctuation（默认）=
+    # 纯标点模式——间隙阈值视为无穷大（静音间隙完全不切）、word 模式说话人
+    # 变化不切分、同人二次聚合跳过；hybrid = 上一代三维混合行为。
+    # 仅 punctuation_split=True 时生效（False 时 mode 被忽略，纯间隙行为）
+    punctuation_only = bool(punctuation_split) and str(segment_split_mode) == "punctuation"
+    gap_threshold_eff = float("inf") if punctuation_only else float(segment_gap_threshold)
 
     cursor = 0
     segments: List[dict] = []
@@ -628,14 +662,22 @@ def build_segment_response(
             (text, start, end, speaker)
             for (text, start, end), speaker in zip(items, attributions)
         ]
-        groups = _split_by_speaker(
-            pairs, segment_gap_threshold, max_segment_seconds, hard_boundaries
-        )
-        groups = _merge_same_speaker(
-            groups, turns, speaker_merge_gap, max_segment_seconds,
-            blocked=[(start, end) for _, start, end in coarse],
-            hard_boundaries=hard_boundaries,
-        )
+        if punctuation_only:
+            # 纯标点模式：仅硬边界/段长切分（说话人变化不拆段），跳过同人
+            # 二次聚合（speaker_merge_gap 无操作）；段 speaker/speakers 仍由
+            # _word_vote 投票产出（段内混合说话人时 dominant 为票数多者）
+            groups = _split_groups(
+                pairs, gap_threshold_eff, max_segment_seconds, hard_boundaries
+            )
+        else:
+            groups = _split_by_speaker(
+                pairs, gap_threshold_eff, max_segment_seconds, hard_boundaries
+            )
+            groups = _merge_same_speaker(
+                groups, turns, speaker_merge_gap, max_segment_seconds,
+                blocked=[(start, end) for _, start, end in coarse],
+                hard_boundaries=hard_boundaries,
+            )
         for group in groups:
             seg_start = group[0][1]
             seg_end = group[-1][2]
@@ -662,8 +704,9 @@ def build_segment_response(
             dominant_records.append((speaker, seg_end - seg_start))
     else:
         # ---- segment 模式：段级重叠投票（原有行为，代码路径零改动）----------
+        # 纯标点模式同样生效：gap_threshold_eff=inf 时仅硬边界/段长切分
         for group in _split_groups(
-            items, segment_gap_threshold, max_segment_seconds, hard_boundaries
+            items, gap_threshold_eff, max_segment_seconds, hard_boundaries
         ):
             seg_start = group[0][1]
             seg_end = group[-1][2]
@@ -835,16 +878,17 @@ def self_test() -> None:
     ]
 
     # 边界语义：间隙恰好等于阈值（1.0）→ 含边界（>=）切分；阈值调大则不切
+    # （间隙切分仅 hybrid 模式，显式传 mode="hybrid"）
     boundary_items = [ali("a", 0.0, 1.0), ali("b", 2.0, 3.0)]  # 间隙 1.0
-    resp = build_segment_response(boundary_items, [], "a b", "English", 3.0, segment_gap_threshold=1.0, speaker_attribution="segment")
+    resp = build_segment_response(boundary_items, [], "a b", "English", 3.0, segment_gap_threshold=1.0, speaker_attribution="segment", segment_split_mode="hybrid")
     assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.0), (2.0, 3.0)]
-    resp = build_segment_response(boundary_items, [], "a b", "English", 3.0, segment_gap_threshold=1.25, speaker_attribution="segment")
+    resp = build_segment_response(boundary_items, [], "a b", "English", 3.0, segment_gap_threshold=1.25, speaker_attribution="segment", segment_split_mode="hybrid")
     assert len(resp["segments"]) == 1
 
-    # 阈值参数透传：同一间隙 0.6，默认不切、threshold=0.5 切
+    # 阈值参数透传：同一间隙 0.6，默认不切、threshold=0.5 切（hybrid 模式）
     gap_items = [ali("a", 0.0, 1.0), ali("b", 1.6, 2.0)]
-    assert len(build_segment_response(gap_items, [], "a b", "English", 2.0, speaker_attribution="segment")["segments"]) == 1
-    resp = build_segment_response(gap_items, [], "a b", "English", 2.0, segment_gap_threshold=0.5, speaker_attribution="segment")
+    assert len(build_segment_response(gap_items, [], "a b", "English", 2.0, speaker_attribution="segment", segment_split_mode="hybrid")["segments"]) == 1
+    resp = build_segment_response(gap_items, [], "a b", "English", 2.0, segment_gap_threshold=0.5, speaker_attribution="segment", segment_split_mode="hybrid")
     assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.0), (1.6, 2.0)]
 
     # ---- 3. 30s 段长强切 ----------------------------------------------------
@@ -930,6 +974,7 @@ def self_test() -> None:
         process_time=2.71828,
         speaker_attribution="segment",
         segment_gap_threshold=0.8,  # 显式旧阈值：间隙 1.0 >= 0.8 → 两段（新默认 2.0 下不切）
+        segment_split_mode="hybrid",  # 间隙切分仅 hybrid 模式
     )
     segs = resp["segments"]
     assert [(s["start"], s["end"]) for s in segs] == [(0.0, 3.0), (4.0, 5.0)]
@@ -1096,6 +1141,7 @@ def self_test() -> None:
         language_name="Chinese",
         duration=3.5,
         speaker_merge_gap=3.0,
+        segment_split_mode="hybrid",  # 短插话保护依赖间隙切分 + 聚合阻断
     )
     assert [(s["start"], s["end"], s["speaker"]) for s in resp["segments"]] == [
         (0.0, 0.75, "SPEAKER_00"), (2.75, 3.5, "SPEAKER_00"),
@@ -1111,16 +1157,19 @@ def self_test() -> None:
         duration=3.0,
         segment_gap_threshold=0.8,
         speaker_merge_gap=0.0,
+        segment_split_mode="hybrid",  # 间隙切分 + 聚合均仅 hybrid 模式
     )
     assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 0.8), (2.0, 2.8)]
 
-    # 全 None 归属（无 diarization，默认 word 模式）：仅按间隙/段长切分，段 speaker=null
+    # 全 None 归属（无 diarization，默认 word 模式）：仅按间隙/段长切分，
+    # 段 speaker=null（间隙 2.0 恰达阈值 → 切分，hybrid 模式）
     resp = build_segment_response(
         align_items=[ali("你好", 0.0, 1.0), ali("世界", 3.0, 4.0)],
         diarization=[],
         full_text="你好世界",
         language_name="Chinese",
         duration=4.0,
+        segment_split_mode="hybrid",
     )
     assert [(s["start"], s["end"], s["speaker"], s["speakers"]) for s in resp["segments"]] == [
         (0.0, 1.0, None, []), (3.0, 4.0, None, []),
@@ -1198,12 +1247,15 @@ def self_test() -> None:
     assert boundaries == [True] and puncts == ["？！"]
     assert matched is True and last_end == 5
 
-    # 跨失败块边界 puncts 置空（boundaries 保持原判定）：两词时间间隙
-    # [1.0, 4.0] 与 coarse 块区间相交、between-span 含句号
+    # 跨失败块边界 puncts 置空 + 强制切分（遗留 ❶ 修复）：两词时间间隙
+    # [1.0, 4.0] 与 coarse 块区间相交、between-span 含句号 → True + 置空
     coarse_pair = [("甲", 0.0, 1.0), ("乙", 4.0, 5.0)]
     boundaries, puncts, _, _ = _sentence_end_boundaries(coarse_pair, "甲。乙", [(1.5, 3.5)])
     assert boundaries == [True] and puncts == [""]  # 置空，切分照常
-    # 不相交的 coarse 区间不影响 puncts 收集
+    # 无句末标点 + 跨失败块 → 强制切分 True（遗留 ❶：段不得横跨失败块）
+    boundaries, puncts, _, _ = _sentence_end_boundaries(coarse_pair, "甲乙", [(1.5, 3.5)])
+    assert boundaries == [True] and puncts == [""]
+    # 不相交的 coarse 区间不影响 puncts 收集与切分判定
     boundaries, puncts, _, _ = _sentence_end_boundaries(coarse_pair, "甲。乙", [(10.0, 11.0)])
     assert boundaries == [True] and puncts == ["。"]
 
@@ -1336,13 +1388,15 @@ def self_test() -> None:
     assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 29.75), (31.688, 34.625)]
     assert [s["text"] for s in resp["segments"]] == ["甲乙丙丁戊己庚辛壬癸子丑寅", "卯辰"]
 
-    # 长静音仍切分（spec Scenario）：无标点间隙恰好 2.0（含边界值）→ 切分
+    # 长静音仍切分（spec Scenario，hybrid 模式）：无标点间隙恰好 2.0
+    # （含边界值）→ 切分（punctuation 模式下间隙不切，见组 18 专项断言）
     resp = build_segment_response(
         align_items=[ali("甲", 0.0, 1.0), ali("乙", 3.0, 4.0)],
         diarization=[],
         full_text="甲乙",
         language_name="Chinese",
         duration=4.0,
+        segment_split_mode="hybrid",
     )
     assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.0), (3.0, 4.0)]
 
@@ -1377,14 +1431,16 @@ def self_test() -> None:
     )
     assert [(s["start"], s["end"], s["speaker"]) for s in resp["segments"]] == [(0.0, 2.0, "SPEAKER_00")]
 
-    # 默认参数下聚合零触发（spec 推导结论）：默认 gap 2.0 / merge_gap 2.0，
-    # 同人间隙 2.5s 切分两段后 gap ≥ 2.0 不满足合并条件 gap < 2.0 → 不合并
+    # 默认参数下聚合零触发（spec 推导结论，hybrid 模式）：默认 gap 2.0 /
+    # merge_gap 2.0，同人间隙 2.5s 切分两段后 gap ≥ 2.0 不满足合并条件
+    # gap < 2.0 → 不合并
     resp = build_segment_response(
         align_items=[ali("甲", 0.0, 1.0), ali("乙", 3.5, 4.5)],
         diarization=[("SPEAKER_00", 0.0, 4.5)],
         full_text="甲乙",
         language_name="Chinese",
         duration=4.5,
+        segment_split_mode="hybrid",
     )
     assert [(s["start"], s["end"], s["speaker"]) for s in resp["segments"]] == [
         (0.0, 1.0, "SPEAKER_00"), (3.5, 4.5, "SPEAKER_00"),
@@ -1418,14 +1474,15 @@ def self_test() -> None:
     assert resp["segments"][0]["text"] == "今天不错。明天更好"
 
     # ---- 17. match 失败回退 / 说话人变化无标点照切 / segment 模式标点切分 -----
-    # match 失败回退（spec Scenario 标点信息缺失回退）：item 文本不在
-    # full_text → 纯间隙行为（无标点切分、无标点追加），不抛异常
+    # match 失败回退（spec Scenario 标点信息缺失回退，hybrid 模式）：item
+    # 文本不在 full_text → 纯间隙行为（无标点切分、无标点追加），不抛异常
     resp = build_segment_response(
         align_items=[ali("甲乙", 0.0, 1.0), ali("丙丁", 4.0, 5.0)],  # 间隙 3.0 ≥ 2.0
         diarization=[],
         full_text="完全不同的文本",
         language_name="Chinese",
         duration=5.0,
+        segment_split_mode="hybrid",
     )
     assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.0), (4.0, 5.0)]
     assert [s["text"] for s in resp["segments"]] == ["甲乙", "丙丁"]  # 回退拼接，无追加
@@ -1440,13 +1497,14 @@ def self_test() -> None:
     assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 2.0)]
     assert resp["segments"][0]["text"] == "甲乙"  # "甲"匹配失败 → 全量回退
 
-    # 说话人变化无标点处照切（word 模式核心价值，不受标点影响）
+    # 说话人变化无标点处照切（word 模式核心价值，不受标点影响；hybrid 模式）
     resp = build_segment_response(
         align_items=[ali("你好", 0.0, 1.0), ali("没事", 1.2, 2.0)],  # 间隙 0.2，无标点
         diarization=[("SPEAKER_00", 0.0, 1.0), ("SPEAKER_01", 1.1, 2.0)],
         full_text="你好没事",
         language_name="Chinese",
         duration=2.0,
+        segment_split_mode="hybrid",
     )
     assert [(s["start"], s["end"], s["speaker"]) for s in resp["segments"]] == [
         (0.0, 1.0, "SPEAKER_00"), (1.2, 2.0, "SPEAKER_01"),
@@ -1465,5 +1523,137 @@ def self_test() -> None:
     assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.0), (1.2, 1.5), (1.7, 2.0)]
     assert [s["text"] for s in resp["segments"]] == ["说号就行。", "啊？", "说吧。"]
     assert "".join(s["text"] for s in resp["segments"]) == resp["text"]
+
+    # ---- 18. punctuation 模式专项（新默认：间隙/说话人变化均不切分）----------
+    # 长停顿不拆段（spec Scenario 一句话中间长停顿不再拆段，用户问题 1）：
+    # 无标点间隙 3.0s > 2.0 阈值 → punctuation 模式不切（gap 阈值视为无穷大）
+    pause3_items = [ali("想", 0.0, 1.0), ali("负责", 4.0, 5.0)]  # 间隙 3.0
+    resp = build_segment_response(
+        align_items=pause3_items,
+        diarization=[],
+        full_text="想负责",
+        language_name="Chinese",
+        duration=5.0,
+    )
+    assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 5.0)]
+    assert resp["segments"][0]["text"] == "想负责"
+    # hybrid 对照：同一 fixture 间隙 3.0 ≥ 2.0 → 切为两段
+    resp = build_segment_response(
+        align_items=pause3_items,
+        diarization=[],
+        full_text="想负责",
+        language_name="Chinese",
+        duration=5.0,
+        segment_split_mode="hybrid",
+    )
+    assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.0), (4.0, 5.0)]
+
+    # 句中说话人变化不拆段（spec Scenario）：word 模式、无标点、说话人变化
+    # → 不切分；段 speaker=词归属票数多者（dominant），speakers=去重集合
+    resp = build_segment_response(
+        align_items=[
+            ali("你", 0.0, 0.3), ali("好", 0.3, 0.6), ali("啊", 0.6, 0.9),  # SPEAKER_00 ×3
+            ali("没", 1.0, 1.3), ali("事", 1.3, 1.6),                        # SPEAKER_01 ×2
+        ],
+        diarization=[("SPEAKER_00", 0.0, 0.9), ("SPEAKER_01", 1.0, 1.6)],
+        full_text="你好啊没事",
+        language_name="Chinese",
+        duration=1.6,
+    )
+    assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.6)]
+    assert resp["segments"][0]["speaker"] == "SPEAKER_00"  # 3 票 > 2 票
+    assert resp["segments"][0]["speakers"] == ["SPEAKER_00", "SPEAKER_01"]  # 词数降序
+    assert resp["segments"][0]["text"] == "你好啊没事"
+    # hybrid 对照：同 fixture 说话人变化处切分（组 17 已有同类断言，此处仅对照段数）
+    resp = build_segment_response(
+        align_items=[
+            ali("你", 0.0, 0.3), ali("好", 0.3, 0.6), ali("啊", 0.6, 0.9),
+            ali("没", 1.0, 1.3), ali("事", 1.3, 1.6),
+        ],
+        diarization=[("SPEAKER_00", 0.0, 0.9), ("SPEAKER_01", 1.0, 1.6)],
+        full_text="你好啊没事",
+        language_name="Chinese",
+        duration=1.6,
+        segment_split_mode="hybrid",
+    )
+    assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 0.9), (1.0, 1.6)]
+
+    # 段长兜底强切（punctuation 模式下唯一的非标点切分来源）：无标点长 span
+    long_items = [ali("甲", 0.0, 15.0), ali("乙", 15.5, 30.5)]  # span 30.5 > 30
+    resp = build_segment_response(
+        align_items=long_items,
+        diarization=[],
+        full_text="甲乙",
+        language_name="Chinese",
+        duration=30.5,
+    )
+    assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 15.0), (15.5, 30.5)]
+
+    # match 失败回退仅剩段长（spec Scenario 整体匹配失败回退退化）：item 文本
+    # 不在 full_text → 标点信息缺失，punctuation 模式下小间隙不切（单段）；
+    # 30s 以上长 span 仅段长强切（cut 兜底不受匹配失败影响）
+    resp = build_segment_response(
+        align_items=[ali("甲", 0.0, 1.0), ali("乙", 1.5, 2.0)],  # 间隙 0.5
+        diarization=[],
+        full_text="完全不同的文本",
+        language_name="Chinese",
+        duration=2.0,
+    )
+    assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 2.0)]
+    miss_items = [ali("甲", 0.0, 15.0), ali("乙", 15.5, 30.5)]
+    resp = build_segment_response(
+        align_items=miss_items,
+        diarization=[],
+        full_text="完全不同的文本",
+        language_name="Chinese",
+        duration=30.5,
+    )
+    assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 15.0), (15.5, 30.5)]
+
+    # off 时 mode 无效（spec Scenario punctuation-split off 组合）：off +
+    # mode=punctuation（默认）→ mode 被忽略，纯间隙/段长行为（间隙 3.0 ≥ 2.0 切）
+    resp = build_segment_response(
+        align_items=pause3_items,
+        diarization=[],
+        full_text="想负责",
+        language_name="Chinese",
+        duration=5.0,
+        punctuation_split=False,
+    )
+    assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.0), (4.0, 5.0)]
+
+    # segment 归属模式：punctuation 模式同样生效（间隙 3.0 不切，标点照切）
+    resp = build_segment_response(
+        align_items=[ali("你好", 0.0, 1.0), ali("世界", 4.0, 5.0)],
+        diarization=[],
+        full_text="你好。世界",
+        language_name="Chinese",
+        duration=5.0,
+        speaker_attribution="segment",
+    )
+    assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.0), (4.0, 5.0)]
+    assert [s["text"] for s in resp["segments"]] == ["你好。", "世界"]
+
+    # 跨失败块强制切分（遗留 ❶ 回归，spec Scenario 无标点跨失败块恒切分）：
+    # 交界无句末标点（fixture 避开遗留 ❸ 交界标点丢失场景）+ 间隙 < 2.0s +
+    # 跨 coarse 块 → punctuation 与 hybrid 两模式均切分；段文本不含失败块
+    # 文本（失败块文本仅计入粗段一次），交界无标点下按 start 排序拼接一致
+    coarse_fixture = [ali("甲", 0.0, 1.0), ali("乙", 1.9, 2.5)]  # 间隙 [1.0, 1.9] < 2.0
+    for mode in ("punctuation", "hybrid"):
+        resp = build_segment_response(
+            align_items=coarse_fixture,
+            diarization=[("SPEAKER_00", 0.0, 2.5)],
+            full_text="甲失败块文本乙",
+            language_name="Chinese",
+            duration=2.5,
+            coarse_chunks=[("失败块文本", 1.1, 1.8)],  # 与间隙 [1.0, 1.9] 相交
+            segment_split_mode=mode,
+        )
+        segs = resp["segments"]
+        assert [(s["start"], s["end"]) for s in segs] == [(0.0, 1.0), (1.1, 1.8), (1.9, 2.5)]
+        # 段文本不含失败块文本：若无强制切分，首段会截成"甲失败块文本"（重复）
+        assert segs[0]["text"] == "甲" and segs[2]["text"] == "乙"
+        assert segs[1]["text"] == "失败块文本"  # 粗段取块 ASR 原文（仅计入一次）
+        assert "".join(s["text"] for s in segs) == resp["text"]  # 交界无标点 → 拼接一致
 
     print("pipeline self_test ok")

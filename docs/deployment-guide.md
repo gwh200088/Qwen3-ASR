@@ -1,6 +1,7 @@
 # Qwen3-ASR segment 时间戳 + 说话人识别服务 · 部署操作手册
 
-> 推荐镜像：`qwen3-asr-offline:cu128-hotfix`（基础镜像 + 3 项实机运行时修复，2026-08-20 A10 实机验证通过）
+> 推荐镜像：`qwen3-asr-offline:cu128-punct2`（punct + 纯标点切分模式 + 说话人调参与 CAM++ 中文声纹，2026-08-24 容器内全量验证通过）
+> 上一代镜像：`qwen3-asr-offline:cu128-punct`（标点感知分段 v1）；`qwen3-asr-offline:cu128-hotfix`（基础镜像 + 3 项实机运行时修复）
 > 基础镜像：`qwen3-asr-offline:cu128`（基于 `dev` 分支构建，`BUNDLE_FLASH_ATTENTION=false`）
 > 部署模式：**完全离线**（模型本地目录挂载，全程零网络）
 > 服务能力：vLLM ASR 转写 + segment 级时间戳（强制对齐）+ pyannote 说话人识别，支持最长 1 小时音频
@@ -13,7 +14,7 @@
 |---|---|
 | ASR 转写 | Qwen3-ASR-1.7B，30 种语言（中/英/粤/日/韩/法/德 等），vLLM 推理 |
 | segment 时间戳 | Qwen3-ForcedAligner-0.6B 强制对齐，输出句级 start/end |
-| 说话人识别 | pyannote community-1 管线（VBx 聚类 + PLDA），输出 speaker 标签 |
+| 说话人识别 | pyannote community-1 管线（VBx 聚类 + PLDA；可选切换 CAM++ 中文声纹 + AHC 聚类，见 §2.4），输出 speaker 标签 |
 | 最大音频时长 | 3600 秒（1 小时），由 `--max-audio-seconds` 控制 |
 | 并发 | 显存感知调度：显存足够则并发（默认双并发），不足自动排队 |
 | 接口 | OpenAI 兼容 `POST /v1/audio/transcriptions`（multipart） |
@@ -26,7 +27,9 @@
 | 镜像 | 内容 | 用途 |
 |---|---|---|
 | `qwen3-asr-offline:cu128` | 基础镜像（Dockerfile-qwen3-asr-cu128 完整构建） | 构建产物基座 |
-| `qwen3-asr-offline:cu128-hotfix` | 基础镜像 + 3 个运行时修复（Dockerfile-qwen3-asr-hotfix） | **生产部署用这个** |
+| `qwen3-asr-offline:cu128-hotfix` | 基础镜像 + 3 个运行时修复（Dockerfile-qwen3-asr-hotfix，§2.1） | 历史版本 |
+| `qwen3-asr-offline:cu128-punct` | hotfix + 标点感知分段 v1（Dockerfile-qwen3-asr-punct，代码全量覆盖） | 上一代 |
+| `qwen3-asr-offline:cu128-punct2` | punct + 纯标点切分模式 + 说话人调参 + CAM++ 中文声纹（Dockerfile-qwen3-asr-punct2，代码全量覆盖，§2.4） | **生产部署用这个** |
 
 ### 2.1 hotfix 镜像包含的修复（2026-08-20 GPU 实机首跑发现）
 
@@ -39,7 +42,14 @@
 ### 2.2 镜像内容判别
 
 ```bash
-docker run --rm --entrypoint sh qwen3-asr-offline:cu128-hotfix -c \
+# 判别是否 punct2（含 CAM++ wrapper 与切分模式参数）：
+docker run --rm --entrypoint sh qwen3-asr-offline:cu128-punct2 -c \
+  "ls /usr/local/lib/python3.10/dist-packages/qwen_asr/inference/campplus_speaker_embedding.py \
+   && grep -c 'segment-split-mode' /usr/local/lib/python3.10/dist-packages/qwen_asr/cli/serve.py"
+# 两项均输出 = punct2；文件不存在 = punct 或更旧
+
+# 判别是否含 hotfix fix3（历史命令，对 punct/punct2 同样适用——两者基于 hotfix 构建）：
+docker run --rm --entrypoint sh qwen3-asr-offline:cu128-punct2 -c \
   "grep -c '_release_gpu_cache' /usr/local/lib/python3.10/dist-packages/qwen_asr/service/middleware.py"
 # 输出 2 = 已含 fix3；报错/输出 0 = 旧镜像
 ```
@@ -55,6 +65,42 @@ docker restart qwen3-asr
 ```
 
 > 正式部署请使用 hotfix 镜像；`docker cp` 的修改随容器删除而丢失，仅用于快速验证。
+
+### 2.4 punct2 镜像新增能力（2026-08-24，分支 feat/punct-split-diarization-tuning）
+
+punct2 基于 punct 镜像全量覆盖 `qwen_asr/` 代码（依赖不变、镜像层级叠加，构建秒级），新增三组能力（完整参数语义见 §6.3，切分规则见 §8.3.3）：
+
+**1. segment 切分模式（修复"一句话被拆成两段"）**
+
+- 新增 `--segment-split-mode {punctuation, hybrid}`，**默认 punctuation**：只按**句末标点 + 段长兜底（30s）**切分，**静音间隙与句中说话人变化不再触发切分**——一句话只要没有句末标点就不会被拆开；
+- `hybrid` = 上一代（punct）行为：标点 + 间隙（`--segment-gap-threshold`）+ 说话人变化三维混合；`--segment-gap-threshold` 与 `--speaker-merge-gap` **仅 hybrid 模式生效**（punctuation 模式下均为无操作参数）；
+- 跨对齐失败块边界强制切分：正常段不再横跨失败块（修复段文本截入失败块文本的问题，§8.3.2）；
+- **match 失败回退 trade-off**：对齐词文本在全文匹配失败（英文/缩写密集内容更易触发）时整体回退段长兜底切分，症状为约 30s 均匀粗块——此类内容建议显式 `--segment-split-mode hybrid`。
+
+**2. 说话人识别调参（修复"两个男性说话人被合并成一个 speaker"）**
+
+- `--diarization-min-speakers` / `--diarization-max-speakers`：说话人数约束服务级默认（请求级 `min_speakers`/`max_speakers` 未传时回退到此值）；**固定人数场景（如已知双人对话）设 `min=max=2`** 效果最直接；
+- `--diarization-clustering-threshold`：聚类阈值覆写，合法区间 (0, 2)；**调低更倾向拆分说话人**（过度调低会过分割一人成多）。两条聚类路径（wespeaker/VBx 与 campplus/AHC）的默认值不同，以部署机模型 config.yaml 实测为准。
+
+**3. CAM++ 中文声纹模型（`--diarizer-embedding campplus`）**
+
+- 默认 `wespeaker`（community-1 管线现状，英文域声纹）不变；切换 `campplus` 后加载后组件替换注入 **CAM++ 中文声纹**（ModelScope `iic/speech_campplus_sv_zh-cn_16k-common`，CN-Celeb 中文语料训练，192 维）+ **3.1 式 AHC 余弦聚类**，从向量层面拉开中文相近男声的距离（构建机实测同人余弦 0.69 / 异人 -0.08，判别力显著）；
+- 需配 `--diarizer-embedding-model <目录>`（模型目录含 `campplus_cn_common.bin` + `config.yaml`，共约 27MB，下载后与三模型一同挂载到 `/models`）；模型目录缺失/注入失败启动即报错（中文消息，不静默回退）；
+- **参数组合告警语义**：`--diarizer-embedding campplus` + `--diarizer ""`（diarizer 禁用）→ WARNING（embedding 参数无效果，不阻断启动）；`wespeaker` 模式传 `--diarizer-embedding-model` → 忽略 + WARNING（仅 campplus 模式生效）；
+- **一键回退**：`--diarizer-embedding wespeaker` 即恢复上一代声纹路径（无需换镜像）。
+
+**构建命令**（构建上下文仅需 `qwen_asr/` 目录，~600KB）：
+
+```bash
+# 本机构建（仓库根目录）：
+docker build -f docker/Dockerfile-qwen3-asr-punct2 -t qwen3-asr-offline:cu128-punct2 .
+
+# 目标机轻量构建（免重传基础镜像，推荐）：把 Dockerfile 与整个 qwen_asr/ 目录
+# 传到目标机 /data/patch/，目标机已有 qwen3-asr-offline:cu128-punct 时：
+cd /data/patch && docker build -t qwen3-asr-offline:cu128-punct2 .
+```
+
+**CAM++ A/B 实测结论**（东北话两男真实音频，wespeaker vs campplus）：**待部署机实测后回填**（当前构建机仅完成 CPU 前向冒烟与示例音频判别验证；部署机 A/B 结论将决定 `--diarizer-embedding` 默认值是否切换为 campplus）。
 
 ---
 
@@ -80,6 +126,7 @@ docker restart qwen3-asr
 | `Qwen3-ASR-1.7B` | 4.4 GB | ASR 主模型 | `/models/Qwen3-ASR-1.7B` |
 | `Qwen3-ForcedAligner-0.6B` | 1.8 GB | 强制对齐模型 | `/models/Qwen3-ForcedAligner-0.6B` |
 | `pyannote-speaker-diarization-community-1` | 33 MB | 说话人识别管线 | `/models/pyannote-speaker-diarization-community-1` |
+| `speech_campplus_sv_zh-cn_16k-common`（可选） | 27 MB | CAM++ 中文声纹模型（`--diarizer-embedding campplus` 时必需，见 §2.4） | `/models/speech_campplus_sv_zh-cn_16k-common` |
 
 **不需要的模型**：`pyannote-speaker-diarization-3.1`、`pyannote-segmentation-3.0`、`pyannote-wespeaker-voxceleb-resnet34-LM`、`MOSS-Transcribe-Diarize`。
 原因：community-1 管线是**自包含**的——其 `config.yaml` 以相对路径（`$model/segmentation`、`$model/embedding`、`$model/plda`）引用子模型，三个子模型全部随目录自带，不引用任何外部 HF 仓库。
@@ -95,6 +142,10 @@ ls /data/models/Qwen3-ASR-1.7B
 
 ls /data/models/Qwen3-ForcedAligner-0.6B
 # 预期包含：config.json  model.safetensors  ...
+
+# 可选：启用 CAM++ 中文声纹（--diarizer-embedding campplus）时检查
+ls /data/models/speech_campplus_sv_zh-cn_16k-common
+# 预期包含：campplus_cn_common.bin  config.yaml
 ```
 
 ---
@@ -104,8 +155,8 @@ ls /data/models/Qwen3-ForcedAligner-0.6B
 ### 5.1 导入镜像
 
 ```bash
-docker load < qwen3-asr-offline-cu128-hotfix.tar.gz
-# 预期末尾：Loaded image: qwen3-asr-offline:cu128-hotfix
+docker load < qwen3-asr-offline-cu128-punct2.tar.gz
+# 预期末尾：Loaded image: qwen3-asr-offline:cu128-punct2
 
 docker images | grep qwen3-asr-offline   # 确认存在
 ```
@@ -121,10 +172,14 @@ tar xzf qwen3-asr-models.tar.gz -C /data/models
 # /data/models/pyannote-speaker-diarization-community-1
 ```
 
+> 可选：启用 CAM++ 中文声纹（`--diarizer-embedding campplus`，§2.4）时，另将
+> `speech_campplus_sv_zh-cn_16k-common/` 目录（构建机 ModelScope 下载产物，~27MB）
+> 放入 `/data/models/`——无需重打模型 tar，随挂载目录一并可见。
+
 ### 5.3 冒烟验证（镜像内依赖完整性，可选但推荐）
 
 ```bash
-docker run --rm qwen3-asr-offline:cu128-hotfix python3 -c "
+docker run --rm qwen3-asr-offline:cu128-punct2 python3 -c "
 import warnings; warnings.filterwarnings('ignore')
 import vllm, pyannote.audio, transformers, torchcodec, torch
 from qwen_asr.service.middleware import TranscriptionsMiddleware
@@ -145,7 +200,7 @@ docker run -d --name qwen3-asr --restart unless-stopped \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
   -v /data/models:/models:ro \
-  qwen3-asr-offline:cu128-hotfix \
+  qwen3-asr-offline:cu128-punct2 \
   qwen-asr-serve /models/Qwen3-ASR-1.7B --served-model-name qwen3-asr \
     --host 0.0.0.0 --port 80 \
     --forced-aligner /models/Qwen3-ForcedAligner-0.6B \
@@ -157,6 +212,15 @@ docker run -d --name qwen3-asr --restart unless-stopped \
 首次启动加载三个模型约需 **1~3 分钟**，用 `docker logs -f qwen3-asr` 观察，看到 vLLM `Uvicorn running on ...` 即就绪。
 
 > **`--max-num-batched-tokens 8192` 必须加**：vLLM 默认值 2048 会导致长音频请求停滞卡死（详见 §11 #2），该参数是本次实机调试确认的关键修复。
+
+> 上述命令已含 punct2 全部默认行为（punctuation 切分模式 + wespeaker 声纹），无需额外参数。
+> **中文双人对话场景推荐**（相近男声被合并时，参数追加在 `qwen-asr-serve` 命令尾部，见 §2.4）：
+>
+> ```bash
+>     --diarization-min-speakers 2 --diarization-max-speakers 2 \
+>     --diarizer-embedding campplus \
+>     --diarizer-embedding-model /models/speech_campplus_sv_zh-cn_16k-common
+> ```
 
 ### 6.2 Docker 参数说明
 
@@ -184,18 +248,24 @@ docker run -d --name qwen3-asr --restart unless-stopped \
 | `--forced-aligner` | `Qwen/Qwen3-ForcedAligner-0.6B` | 对齐模型名/本地路径。**离线部署必传本地路径**；显式传空串（`--forced-aligner ""`）禁用对齐功能 |
 | `--diarizer` | `pyannote/speaker-diarization-community-1` | 说话人识别管线名/本地路径。**离线部署必传本地路径**；显式空串禁用 |
 | `--pyannote-token` | 无 | HF 访问令牌（联网加载门控模型用）。**离线本地路径加载不需要**，缺省依次取环境变量 `PYANNOTE_API_TOKEN` / `HF_TOKEN` |
+| `--diarization-min-speakers` | 无 | 说话人数下限服务级默认（无 = 不约束）：请求级 `min_speakers` 未传时回退到此值，透传 pyannote 聚类约束；**固定人数场景（如已知双人对话）设 min=max=2 效果最直接**（缓解相近说话人被合并） |
+| `--diarization-max-speakers` | 无 | 说话人数上限服务级默认（无 = 不约束）：请求级 `max_speakers` 未传时回退到此值；与下限同时设置时下限不得大于上限（启动报错） |
+| `--diarization-clustering-threshold` | 无 | 说话人聚类阈值服务级覆写，合法区间 (0, 2)；**调低更倾向拆分说话人**（过度调低会过分割一人成多）；无 = 管线默认（wespeaker/VBx 与 campplus/AHC 两条路径默认值不同，以部署机模型 config.yaml 为准）。仅 diarizer 启用时生效 |
+| `--diarizer-embedding` | `wespeaker` | diarization 声纹向量化模式：`wespeaker`（默认，community-1 管线现状，英文域声纹 + VBx 聚类）/ `campplus`（CAM++ 中文声纹 + 3.1 式 AHC 余弦聚类，缓解中文相近男声被合并，见 §2.4；需配 `--diarizer-embedding-model`） |
+| `--diarizer-embedding-model` | 无 | CAM++ 声纹模型本地目录（`campplus` 模式**必填**，含 `campplus_cn_common.bin` + `config.yaml`）；`wespeaker` 模式传入被忽略并告警。目录缺失/注入失败启动即报错（不静默回退） |
 | `--aligner-device` | `cuda:0` | 对齐模型设备；分卡部署时如 `cuda:1` |
 | `--diarizer-device` | `cuda:0` | 说话人识别设备；分卡部署时如 `cuda:1` / `cuda:2` |
 | `--max-concurrent-tasks` | `2` | segment 任务最大并发数（超过即进等待队列） |
 | `--gpu-reserve-mb` | `1024` | 每设备显存安全余量（MB），准入控制用 |
 | `--max-audio-seconds` | `3600.0` | 单条音频时长上限（秒），超限返回 400 |
 | `--max-audio-bytes` | `524288000` | 音频体积上限（字节，默认 500MB） |
-| `--segment-gap-threshold` | `2.0` | 相邻词之间**无句末标点**时触发切分的静音间隙阈值（秒，含边界值）；句末标点处恒切分（切分规则详见 §8.3.3） |
-| `--punctuation-split` | `on` | 句末标点硬切分开关（`on`/`off`）：`on` 时句末标点处恒切分；`off` 为纯间隙切分（段文本标点恢复现状语义）。完整旧行为回退组合 = `off` + `--segment-gap-threshold 0.8`（见 §8.3.3） |
+| `--segment-gap-threshold` | `2.0` | 相邻词之间**无句末标点**时触发切分的静音间隙阈值（秒，含边界值）；句末标点处恒切分；**仅 hybrid 切分模式生效**（punctuation 模式下为无操作参数，切分规则详见 §8.3.3） |
+| `--punctuation-split` | `on` | 句末标点硬切分开关（`on`/`off`）：`on` 时句末标点处恒切分（切分维度模式由 `--segment-split-mode` 选择）；`off` 为纯间隙切分（segment-split-mode 被忽略，段文本标点恢复现状语义）。pre-punct 旧行为回退组合 = `off` + `--segment-gap-threshold 0.8`（见 §8.3.3） |
+| `--segment-split-mode` | `punctuation` | segment 切分维度模式（仅 `--punctuation-split on` 时生效）：`punctuation`（默认，只按**句末标点 + 段长兜底**切分，静音间隙与句中说话人变化不切——修复"一句话被拆成两段"）/ `hybrid`（标点 + 间隙 + 说话人变化三维混合，上一代 punct 行为；`--segment-gap-threshold` 与 `--speaker-merge-gap` 仅此模式生效） |
 | `--max-segment-seconds` | `30.0` | segment 最大段长（秒） |
 | `--align-batch-size` | `4` | 对齐批大小（亦为标准模式 ASR 并发上限） |
-| `--speaker-attribution` | `word` | 说话人归属模式：`word`（默认，词中点投票归属 + 说话人变化切分 + 同人二次聚合）/ `segment`（段级重叠投票，升级前行为）。两种模式下逐块对齐容错与粗段兜底均生效 |
-| `--speaker-merge-gap` | `2.0` | word 模式同人相邻段合并阈值（秒）：自然停顿 < 该值且间隙无他人插话时合并为一段；`0` 表示不合并；负值启动报错；仅 word 模式生效。**默认参数（gap 2.0 / merge_gap 2.0）下聚合不再触发**——间隙切分需间隙 ≥ 2.0s 与合并条件间隙 < 2.0s 互斥（无标点同人停顿 < 2.0s 本就不切分，无需聚合愈合）；仅当显式配置该值**大于** `--segment-gap-threshold` 时聚合生效（如旧组合 gap 0.8 + merge_gap 2.0） |
+| `--speaker-attribution` | `word` | 说话人归属模式：`word`（默认，词中点投票归属；说话人变化切分与同人二次聚合仅 hybrid 切分模式生效，见 §8.3.3）/ `segment`（段级重叠投票，升级前行为）。两种模式下逐块对齐容错与粗段兜底均生效 |
+| `--speaker-merge-gap` | `2.0` | word 模式同人相邻段合并阈值（秒）：自然停顿 < 该值且间隙无他人插话时合并为一段；`0` 表示不合并；负值启动报错；仅 word 归属模式且 **hybrid 切分模式**下生效（punctuation 模式下无操作——切分不含间隙维度，相邻段已由标点/段长边界确定）。**默认参数（gap 2.0 / merge_gap 2.0）下聚合不再触发**——间隙切分需间隙 ≥ 2.0s 与合并条件间隙 < 2.0s 互斥（无标点同人停顿 < 2.0s 本就不切分，无需聚合愈合）；仅当显式配置该值**大于** `--segment-gap-threshold` 时聚合生效（如旧组合 gap 0.8 + merge_gap 2.0） |
 
 **位置参数**：`qwen-asr-serve <model_path>` 为 ASR 主模型路径（必须是 argv 中首个非 flag 参数，或用 `--model` 显式指定）。
 
@@ -259,7 +329,7 @@ docker run -d --name qwen3-asr --restart unless-stopped \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
   -v /data/models:/models:ro \
-  qwen3-asr-offline:cu128-hotfix \
+  qwen3-asr-offline:cu128-punct2 \
   qwen-asr-serve /models/Qwen3-ASR-1.7B --served-model-name qwen3-asr \
     --host 0.0.0.0 --port 80 \
     --forced-aligner /models/Qwen3-ForcedAligner-0.6B \
@@ -285,7 +355,7 @@ docker run -d --name qwen3-asr --restart unless-stopped \
   -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
   -e OMP_NUM_THREADS=8 \
   -v /data/models:/models:ro \
-  qwen3-asr-offline:cu128-hotfix \
+  qwen3-asr-offline:cu128-punct2 \
   qwen-asr-serve /models/Qwen3-ASR-1.7B --served-model-name qwen3-asr \
     --host 0.0.0.0 --port 80 \
     --tensor-parallel-size 2 \
@@ -337,7 +407,7 @@ docker run -d --name qwen3-asr --restart unless-stopped \
 ```
 
   后 `systemctl restart docker`
-- 验证（离线可用）：`docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 qwen3-asr-offline:cu128-hotfix nvidia-smi` 应列出全部目标卡
+- 验证（离线可用）：`docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 qwen3-asr-offline:cu128-punct2 nvidia-smi` 应列出全部目标卡
 - 注意：若 Docker ≥19.03 报 `could not select device driver "" with capabilities: [[gpu]]`，是**未装 nvidia-container-toolkit** 而非版本不支持，安装后继续用 `--gpus` 即可
 - `docker load` 加载本镜像 tar 在 18.x 上兼容（save/load 格式早已定型），不受影响
 
@@ -365,6 +435,10 @@ docker logs qwen3-asr 2>&1 | grep -i "gpu-memory-utilization\|自动注入"
 # 预期（单卡默认拓扑）：可见自动注入 0.70 的 WARNING 日志
 docker logs qwen3-asr 2>&1 | grep "max_num_batched_tokens"
 # 预期：Chunked prefill is enabled with max_num_batched_tokens=8192
+
+# campplus 模式下确认 CAM++ 注入成功（启用 --diarizer-embedding campplus 时）：
+docker logs qwen3-asr 2>&1 | grep "CAM++"
+# 预期：CAM++ 注入完成（生效机制: 加载后组件替换）: embedding=CAM++(192 维, ...)
 ```
 
 > 日志中的 `Repo id must be in the form 'repo_name'...` ERROR 行是 vLLM 对本地路径加载的正常回退日志，**无害可忽略**。
@@ -456,8 +530,8 @@ docker exec qwen3-asr python3 /data/shared/Qwen3-ASR/examples/example_segment_ap
 | `prompt` | string | 否 | 上下文提示（映射到 ASR context，如专有名词、领域词汇） |
 | `timestamp_granularities[]` | string[] | 否 | 含 `segment` 时启用**扩展管线**（segment 时间戳 + 说话人识别）；`word` 粒度 v1 不支持（返回 400） |
 | `response_format` | string | 否 | `json`（默认）/ `text` / `verbose_json`；**segment 模式固定 json**，配 text/verbose_json 返回 400 |
-| `min_speakers` | int | 否 | 说话人数下限（透传 pyannote，仅 segment 模式有效） |
-| `max_speakers` | int | 否 | 说话人数上限（透传 pyannote，仅 segment 模式有效） |
+| `min_speakers` | int | 否 | 说话人数下限（透传 pyannote，仅 segment 模式有效）；**未传时回退服务级默认 `--diarization-min-speakers`**（§6.3） |
+| `max_speakers` | int | 否 | 说话人数上限（透传 pyannote，仅 segment 模式有效）；**未传时回退服务级默认 `--diarization-max-speakers`**（§6.3） |
 
 **两种模式**：
 
@@ -515,17 +589,17 @@ docker exec qwen3-asr python3 /data/shared/Qwen3-ASR/examples/example_segment_ap
 
 | 字段 | `word` 模式（默认） | `segment` 模式 |
 |---|---|---|
-| `segments[].speaker` | 段内**词归属**的 speaker（word 模式按词归属切分，段内理论全同人；洞插值边界情况下取词数最多者，并列取 id 字典序最小者） | 段区间与 diarization 片段重叠时长最大的说话人（段级投票） |
+| `segments[].speaker` | 段内**词归属**的 speaker（hybrid 切分模式按词归属切分，段内理论全同人；punctuation 切分模式不按说话人切分，取段内词数最多者，并列取 id 字典序最小者） | 段区间与 diarization 片段重叠时长最大的说话人（段级投票） |
 | `segments[].speakers` | 段内**词归属**出现过的 speaker 去重集合（按词数降序、id 升序） | 段区间重叠 ≥ 0.1s 的说话人（升级前行为不变） |
 
 **word 模式行为变化**（相对 segment 模式）：
 
-- **快速交锋正确切分**：两人换人间隙小于间隙切分阈值（无句末标点处现行默认 2.0s）时，间隙规则不切分、segment 模式会把两人合进同一 segment 并整段归给主导者（句末标点处除外，见 §8.3.3）；word 模式按词归属在说话人变化点切分（不受标点影响，无标点处照切），A 的词归 A、B 的词归 B，`totalDuration` 精度提升到词粒度；
-- **同人自然停顿聚合**：同人相邻段间隙 < `--speaker-merge-gap` 且间隙内无其他说话人的 diarization 片段（短插话保护，阈值 0.3s）时二次聚合为一段；聚合**不跨越句末标点硬边界**（§8.3.3）；**默认参数（gap 2.0 / merge_gap 2.0）下聚合不再触发**（间隙切分需 ≥ 2.0s 与合并条件 < 2.0s 互斥，硬边界/段长/异人边界均不可合并）——无标点同人停顿 < 2.0s 本就不切分，无需聚合愈合；仅显式配置 merge_gap 大于 gap 阈值时聚合生效；`--speaker-merge-gap 0` 关闭聚合；
+- **快速交锋正确切分**（仅 hybrid 切分模式，§8.3.3）：两人换人间隙小于间隙切分阈值（无句末标点处现行默认 2.0s）时，间隙规则不切分、segment 模式会把两人合进同一 segment 并整段归给主导者（句末标点处除外）；word 模式按词归属在说话人变化点切分（不受标点影响，无标点处照切），A 的词归 A、B 的词归 B，`totalDuration` 精度提升到词粒度。punctuation 切分模式下说话人变化不切分，句中快速换人合入同一 segment（归属见上表）；
+- **同人自然停顿聚合**（仅 hybrid 切分模式）：同人相邻段间隙 < `--speaker-merge-gap` 且间隙内无其他说话人的 diarization 片段（短插话保护，阈值 0.3s）时二次聚合为一段；聚合**不跨越句末标点硬边界**（§8.3.3）；**默认参数（gap 2.0 / merge_gap 2.0）下聚合不再触发**（间隙切分需 ≥ 2.0s 与合并条件 < 2.0s 互斥，硬边界/段长/异人边界均不可合并）——无标点同人停顿 < 2.0s 本就不切分，无需聚合愈合；仅显式配置 merge_gap 大于 gap 阈值时聚合生效；`--speaker-merge-gap 0` 关闭聚合；
 - **洞填充**：词时间中点未落入任何 diarization 片段（漏检/间隙/幻觉词）时按时间邻近性插值推断归属；diarization 整段漏检时该区间 speaker=null；
 - **精度预期**：换人点附近个别词可能错归属——切分精度受 diarization 边界误差（典型 ±0.5s 量级）与重叠语音区词中点投票固有误差限制。word 模式是粒度改进，不承诺词级全对。
 
-**回退到旧行为**：以 `--speaker-attribution segment` 启动可回退归属口径（段级投票）；切分规则（标点感知，§8.3.3）两种归属模式一致，完整旧行为回退组合为 `--punctuation-split off --segment-gap-threshold 0.8`（逐块容错与粗段兜底仍生效，见下节）。
+**回退到旧行为**：以 `--speaker-attribution segment` 启动可回退归属口径（段级投票）；切分规则（标点感知，§8.3.3）两种归属模式一致——上一代切分回退 `--segment-split-mode hybrid`，完整 pre-punct 旧行为回退组合为 `--punctuation-split off --segment-gap-threshold 0.8`（逐块容错与粗段兜底仍生效，见下节）。
 
 #### 8.3.2 对齐逐块容错与粗段兜底（两种模式均生效）
 
@@ -537,33 +611,48 @@ docker exec qwen3-asr python3 /data/shared/Qwen3-ASR/examples/example_segment_ap
 - **精度限制**：粗段粒度为 180s 块级，段内无法定位切点；粗段整段时长计入投票主导的 speaker，次要说话人时长被整段吞掉——`totalDuration` 失真幅度大于段级投票，最长可达 180s；
 - **范围**：本容错仅覆盖对齐计算异常；ASR 分块生成异常仍按现状整请求失败（返回 500）。
 
-#### 8.3.3 segment 切分规则（标点感知）
+#### 8.3.3 segment 切分规则（标点感知，双模式）
 
-segment 切分利用 ASR 文本自带的句末标点，切分条件按以下组合（两种归属模式均生效）：
+segment 切分利用 ASR 文本自带的句末标点，切分维度由 `--segment-split-mode` 决定（两种归属模式均生效）：
+
+**punctuation 模式（punct2 默认）**——只按标点与段长切分：
 
 | # | 切分条件 | 说明 |
 |---|---|---|
 | 1 | 句末标点硬边界 | 相邻对齐词之间的全文文本含句末标点（`。！？；.!?;` 及换行）→ **恒切分，无视时间间隙**；`--punctuation-split off` 时关闭 |
-| 2 | 无句末标点处静音间隙 ≥ `--segment-gap-threshold` | 默认 **2.0s**（原 0.8s，含边界值） |
-| 3 | 段长 > `--max-segment-seconds` | 默认 30s 强切（不变） |
-| 4 | word 模式说话人变化 | 不受标点影响，无标点处照切（不变） |
+| 2 | 段长 > `--max-segment-seconds` | 默认 30s 强切——**punctuation 模式下唯一的非标点切分来源** |
+| 3 | 跨对齐失败块边界 | 与失败块（§8.3.2）相交的边界**强制切分**——正常段不横跨失败块（两模式均生效） |
 
+- **静音间隙与句中说话人变化均不触发切分**：一句话只要没有句末标点就不会被拆开（直接修复"一句话被拆成两段"）；代价是句中快速换人（无标点）时两人合入同一 segment，`speaker` 由段内词归属投票决定、`speakers` 为去重集合（§8.3.1）；
 - **逗号/顿号不是切分点**：`，、,` 保留段内，符合"一句话一个分段"；
-- **同人聚合不跨越标点硬边界**：word 模式二次聚合（§8.3.1）遇句末标点硬边界不合并；
-- **无标点间隙阈值 2.0s 语义**：句中 0.8~2.0s 自然停顿（无句末标点）不再切碎，长静音（≥ 2.0s）仍切分；ASR 不输出标点时全部边界按 2.0s 处理。
+- ASR 不输出标点时全部边界按段长兜底（30s）处理。
 
-**段文本句末标点归属**（`--punctuation-split on` 时，两种归属模式均生效）：
+**hybrid 模式（上一代 punct 行为）**——标点 + 间隙 + 说话人三维混合：
+
+| # | 切分条件 | 说明 |
+|---|---|---|
+| 1 | 句末标点硬边界 | 同 punctuation 模式条件 1 |
+| 2 | 无句末标点处静音间隙 ≥ `--segment-gap-threshold` | 默认 **2.0s**（含边界值）；**仅此模式生效** |
+| 3 | 段长 > `--max-segment-seconds` | 默认 30s 强切 |
+| 4 | word 模式说话人变化 | 不受标点影响，无标点处照切；同人二次聚合（§8.3.1）亦仅此模式生效 |
+
+- **无标点间隙阈值 2.0s 语义**：句中 0.8~2.0s 自然停顿（无句末标点）不再切碎，长静音（≥ 2.0s）仍切分；ASR 不输出标点时全部边界按 2.0s 处理；
+- **同人聚合不跨越标点硬边界**：word 模式二次聚合遇句末标点硬边界不合并。
+
+**段文本句末标点归属**（`--punctuation-split on` 时，两种归属模式与两种切分模式均生效）：
 
 - 切分处词间文本中的句末标点**附前段 `text` 末尾**：连续句末标点（如"？！"）全量追加，空格/引号等非句末标点字符不追加；
 - **末段追加全文尾部句末标点**：全文末词匹配终点之后的句末标点不属于任何词间区间，追加到末段 `text` 末尾，不丢失；
-- **跨对齐失败块边界不追加**：失败块（§8.3.2 粗段兜底）前后相邻词的词间文本含整块失败文本（最长 180s），其句末标点不拼入前段（避免垃圾后缀、避免与粗段原文标点重复）；切分照常发生（跨块间隙 ≥ 失败块时长 ≥ 2.0s，间隙规则必然切分）；
+- **跨对齐失败块边界不追加**：失败块（§8.3.2 粗段兜底）前后相邻词的词间文本含整块失败文本（最长 180s），其句末标点不拼入前段（避免垃圾后缀、避免与粗段原文标点重复）；切分由跨失败块强制切分保证（条件 3）；
 - **拼接无损**：对齐词文本全文匹配成功时，`segments[]` 按 `start` 排序后 `"".join(segments[].text) == text`（`text` 全文字段）——正常段携带词间标点 + 末段尾部标点，粗段取块 ASR 原文（含自身标点），混合场景同样成立。
 
 **回退与降级**：
 
+- 句中静音间隙/说话人变化导致的拆段 → 默认 punctuation 模式已消除；若仍出现，检查启动命令是否显式配置了 `--segment-split-mode hybrid`（误配置回退了行为）；
+- 英文/缩写密集内容（匹配失败回退见下）→ 显式 `--segment-split-mode hybrid`；
 - 线上标点误切（如英文缩写句点，见 §12）→ `--punctuation-split off` 即时关闭标点切分（纯间隙切分，阈值仍 2.0s，无需降级版本）；
-- 完整旧行为 → `--punctuation-split off --segment-gap-threshold 0.8`（此组合下 word 模式同人聚合恢复旧活性）；
-- 对齐词文本在全文中匹配失败（罕见）→ 整体回退纯间隙行为（2.0s），不追加标点，不抛异常。
+- 完整 pre-punct 旧行为 → `--punctuation-split off --segment-gap-threshold 0.8`（此组合下 word 模式同人聚合恢复旧活性）；
+- 对齐词文本在全文中匹配失败（罕见，英文/缩写密集内容更易触发）→ 整体回退：punctuation 模式**仅剩段长兜底**（约 30s 均匀粗块）、hybrid 模式回退纯间隙（2.0s），不追加标点，不抛异常。
 
 ### 8.4 错误响应
 
@@ -595,7 +684,7 @@ OpenAI 风格 `{"error": {"message": ..., "type": "invalid_request_error", ...}}
 | 启动（已创建） | `docker start qwen3-asr` |
 | 重启 | `docker restart qwen3-asr` |
 | 删除容器 | `docker rm -f qwen3-asr` |
-| 更新代码（新镜像） | 构建机重 build → `docker load` 新 tar → `docker rm -f` 旧容器 → 重新 `docker run`（模型目录不动） |
+| 更新代码（新镜像） | **轻量构建（推荐）**：把 `docker/Dockerfile-qwen3-asr-punct2` 与整个 `qwen_asr/` 目录（~600KB）传到目标机 `/data/patch/` → `cd /data/patch && docker build -t qwen3-asr-offline:cu128-punct2 .`（基于目标机已有基础镜像，秒级完成）→ `docker rm -f` 旧容器 → 重新 `docker run`（模型目录不动）；**传统 tar 分发**：构建机重 build → `docker save \| gzip > xxx.tar.gz` → 目标机 `docker load` → 重建容器 |
 | 更新模型 | 替换 `/data/models` 下对应目录 → `docker restart qwen3-asr`（镜像不动） |
 | 回滚 | 保留旧 tar 包 → `docker load` 旧镜像 → 重建容器 |
 
@@ -640,19 +729,19 @@ proxy_send_timeout 900s;
 
 - **现象**：第一个 segment 请求 200 OK 正常返回；第二个请求起永久挂起，traceback 停在 `scheduler.py ... await ticket.future`；`/health/detail` 显示 `freeVramMb` 从 ~3.9GB 掉到 ~2.4GB 不回升，`queuedTasks` 持续 ≥ 1；
 - **原因**：对齐/说话人前向结束后，PyTorch 缓存分配器把空闲显存块留在自己手里不归还驱动 → 调度器用 `mem_get_info` 实测空闲显存做准入判断，误判"显存不足"（阈值 ≈ 2.9GB > 2.4GB）→ 后续任务全部滞留队列。**假死锁**：缓存块实际可复用，并非真占满；
-- **解法**：使用 `cu128-hotfix` 镜像（fix3：任务收尾、调度许可释放前 `torch.cuda.empty_cache()` 归还空闲块）；
+- **解法**：使用 `cu128-punct2`（或 hotfix/punct）镜像（fix3：任务收尾、调度许可释放前 `torch.cuda.empty_cache()` 归还空闲块）；
 - **应急绕过**（旧镜像不改代码）：启动加 `--gpu-reserve-mb 256` 降低准入阈值——但余量被压缩后大任务有 OOM 风险，仅限临时；
 - **验证**：任务完成后 `/health/detail` 的 `freeVramMb` 应回升 ~3.8GB。
 
 ### #4 启动报 `TypeError: 'device' must be an instance of 'torch.device', got 'str'`（hotfix fix1 已修复）
 
 - **原因**：pyannote.audio 4.x 的 `Pipeline.to()` 严格要求 `torch.device` 实例（3.x 两者皆可）；
-- **解法**：使用 hotfix 镜像（统一转换 `torch.device(device)`）。
+- **解法**：使用 punct2（或 hotfix/punct）镜像（统一转换 `torch.device(device)`）。
 
 ### #5 启动报 `RuntimeError: Cannot add middleware after an application has started`（hotfix fix2 已修复）
 
 - **原因**：vLLM 0.14.0 `build_app` 末尾的 SageMaker bootstrap 预建中间件栈，后续 `add_middleware` 误判服务已启动；
-- **解法**：使用 hotfix 镜像（手动插入 `user_middleware` 并重建栈）。
+- **解法**：使用 punct2（或 hotfix/punct）镜像（手动插入 `user_middleware` 并重建栈）。
 
 ### #6 其他已知问题速查
 
@@ -680,8 +769,8 @@ proxy_send_timeout 900s;
 - **同步长响应**：1h 音频高并发时队尾任务等待较久，中间代理超时会切断连接（服务端有断连取消，不白算但客户端拿不到结果）。
 - **`speaker=null` 语义**：无法判定主导说话人的段，其时长不计入任何 speaker 的 totalDuration。
 - **word 归属模式精度上限**：换人点附近个别词可能错归属（受 diarization 边界 ±0.5s 误差限制，见 §8.3.1）；对齐失败块的粗段兜底为 180s 块级粒度，粗段时长整段计入 dominant speaker（见 §8.3.2）。
-- **英文缩写句点误切**（标点切分，§8.3.3）：`Mr. Smith` 类缩写句点被视为句末标点触发误切；词内含句点的 token（`U.S.A.`/`3.14`）经对齐清洗为 `USA`/`314` 后全文匹配失败，走整体回退（纯间隙）不受影响；线上出现误切可 `--punctuation-split off` 即时关闭。
-- **短插话保护区间收窄**（标点切分，§8.3.3）：无标点处 0.8~2.0s 间隙不再切分，原"未转写短插话保护"（间隙内他人 turn ≥ 0.3s 阻止合并）在该区间不再触发——间隙里的未转写插话不再以"段间隙"形式保留；保护仍在实际发生的切分（间隙 ≥ 2.0s、标点边界、说话人变化）后的合并判定中生效。
-- **无标点文本段变长**（标点切分，§8.3.3）：ASR 不输出标点时全部边界按 2.0s（原 0.8s）切分，段更长，仍受 `--max-segment-seconds` 30s 上限约束。
-- **标点匹配失败回退**（标点切分，§8.3.3）：对齐词文本在全文中匹配失败时整体回退纯间隙行为（2.0s），无标点切分信息，不追加标点。
+- **英文缩写句点误切**（标点切分，§8.3.3）：`Mr. Smith` 类缩写句点被视为句末标点触发误切；词内含句点的 token（`U.S.A.`/`3.14`）经对齐清洗为 `USA`/`314` 后全文匹配失败，走整体回退（见下条）不受影响；线上出现误切可 `--punctuation-split off` 即时关闭。
+- **短插话保护区间收窄**（hybrid 切分模式，§8.3.3）：无标点处 0.8~2.0s 间隙不再切分，原"未转写短插话保护"（间隙内他人 turn ≥ 0.3s 阻止合并）在该区间不再触发——间隙里的未转写插话不再以"段间隙"形式保留；保护仍在实际发生的切分（间隙 ≥ 2.0s、标点边界、说话人变化）后的合并判定中生效。punctuation 切分模式下间隙切分整体关闭，保护仅存在于切分后合并判定（不跨标点/失败块边界）。
+- **无标点文本段变长**（标点切分，§8.3.3）：ASR 不输出标点时，hybrid 模式全部边界按 2.0s（原 0.8s）切分、punctuation 模式按段长兜底切分，段更长，均受 `--max-segment-seconds` 30s 上限约束。
+- **标点匹配失败回退**（标点切分，§8.3.3）：对齐词文本在全文中匹配失败（英文/缩写密集内容更易触发）时整体回退——punctuation 模式仅剩段长兜底（约 30s 均匀粗块，段级标点信息全失）、hybrid 模式回退纯间隙行为（2.0s），不追加标点；英文/缩写密集内容建议显式 `--segment-split-mode hybrid`。
 - **word 粒度未支持**：`timestamp_granularities[]=word` 返回 400。

@@ -1,0 +1,34 @@
+# 标点感知分段镜像：基于已构建的 qwen3-asr-offline:cu128-hotfix（含 2026-08-20
+# 三项热修：pyannote 4.x 设备搬运 / vLLM 0.14.0 中间件挂载 / 显存缓存归还），
+# 全量覆盖 qwen_asr/ 包代码（不重装依赖、不重打大镜像）。
+#
+# 覆盖方式（2026-08-23）：删除基础镜像内旧版包代码目录后，以本地仓库
+# qwen_asr/ 完整替换——镜像内代码与本地一字不差，无旧文件残留；涵盖历史
+# 全部改动（三项热修 + 词级说话人归属 + 逐块对齐容错 + 标点感知 Segment 切分：
+# 句末标点硬边界恒切分/无标点间隙阈值默认 2.0/--punctuation-split 开关/
+# 段文本标点附前段与末段尾部追加/跨失败块边界标点置空等，详见
+# docs/deployment-guide.md §8.3.3）。
+#
+# 说明：pip dist-info 安装元数据（RECORD 哈希）不随覆盖更新，不影响运行时
+# import 与服务启动（与既有 hotfix 镜像做法一致）。
+#
+# 本机构建（在仓库根目录执行，构建上下文仅需 qwen_asr/ 目录）：
+#   docker build -f docker/Dockerfile-qwen3-asr-punct -t qwen3-asr-offline:cu128-punct .
+#
+# 目标机构建（免重传基础镜像）：把本文件与整个 qwen_asr/ 目录放到目标机
+#   /data/patch/{Dockerfile, qwen_asr/...}，
+#   cd /data/patch && docker build -t qwen3-asr-offline:cu128-punct .
+#   （目标机已有基础镜像 qwen3-asr-offline:cu128-hotfix，仅需传输 ~500KB 源文件）
+FROM qwen3-asr-offline:cu128-hotfix
+
+# 全量覆盖：先删旧包代码目录（dist-info 元数据保留，pip 依赖解析不受影响），
+# 再完整复制本地 qwen_asr/（含 core/inference/service/cli 全部模块与
+# inference/assets/ 资源文件；__pycache__/*.pyc 已被 .dockerignore 排除）
+RUN rm -rf /usr/local/lib/python3.10/dist-packages/qwen_asr
+COPY qwen_asr/ /usr/local/lib/python3.10/dist-packages/qwen_asr/
+
+# 构建期校验：全量语法编译（防截断文件进镜像；顺带生成 __pycache__ 字节码）
+# + pipeline 分段逻辑离线自测（self_test 纯标准库、无 GPU 依赖；importlib 按
+# 路径加载绕过包 __init__ 的 torch/vllm 重依赖 import，秒级完成）
+RUN python3 -m compileall -q /usr/local/lib/python3.10/dist-packages/qwen_asr \
+ && python3 -c "import importlib.util; spec = importlib.util.spec_from_file_location('punct_pipeline', '/usr/local/lib/python3.10/dist-packages/qwen_asr/service/pipeline.py'); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); m.self_test()"

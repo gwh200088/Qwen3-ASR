@@ -89,6 +89,28 @@ punct2 基于 punct 镜像全量覆盖 `qwen_asr/` 代码（依赖不变、镜�
 - **参数组合告警语义**：`--diarizer-embedding campplus` + `--diarizer ""`（diarizer 禁用）→ WARNING（embedding 参数无效果，不阻断启动）；`wespeaker` 模式传 `--diarizer-embedding-model` → 忽略 + WARNING（仅 campplus 模式生效）；
 - **一键回退**：`--diarizer-embedding wespeaker` 即恢复上一代声纹路径（无需换镜像）。
 
+**启用 CAM++ 的完整启动命令**（基于 §6.1 标准拓扑，可直接复制；模型目录放置见 §5.2）：
+
+```bash
+docker rm -f qwen3-asr
+docker run -d --name qwen3-asr --restart unless-stopped \
+  --gpus '"device=0"' --shm-size 8g -p 8000:80 \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
+  -v /data/models:/models:ro \
+  qwen3-asr-offline:cu128-punct2 \
+  qwen-asr-serve /models/Qwen3-ASR-1.7B --served-model-name qwen3-asr \
+    --host 0.0.0.0 --port 80 \
+    --forced-aligner /models/Qwen3-ForcedAligner-0.6B \
+    --diarizer /models/pyannote-speaker-diarization-community-1 \
+    --diarizer-embedding campplus \
+    --diarizer-embedding-model /models/speech_campplus_sv_zh-cn_16k-common \
+    --gpu-memory-utilization 0.70 \
+    --max-num-batched-tokens 8192
+# 固定双人对话场景可再加：--diarization-min-speakers 2 --diarization-max-speakers 2
+# 验证注入成功：docker logs qwen3-asr 2>&1 | grep "CAM++"（见 §7.1）
+```
+
 **构建命令**（构建上下文仅需 `qwen_asr/` 目录，~600KB）：
 
 ```bash
@@ -174,7 +196,12 @@ tar xzf qwen3-asr-models.tar.gz -C /data/models
 
 > 可选：启用 CAM++ 中文声纹（`--diarizer-embedding campplus`，§2.4）时，另将
 > `speech_campplus_sv_zh-cn_16k-common/` 目录（构建机 ModelScope 下载产物，~27MB）
-> 放入 `/data/models/`——无需重打模型 tar，随挂载目录一并可见。
+> 放入 `/data/models/`——无需重打模型 tar，**也无需改启动命令的 `-v` 挂载参数**（`-v
+> /data/models:/models:ro` 已覆盖，新目录自动可见，仅需重建容器追加启动参数）。
+> 必需文件仅 `campplus_cn_common.bin` + `config.yaml` 两个（目录根部）；`examples/`
+> 子目录（3 条示例音频 ~436KB）仅供离线自测，可不传。若在部署机重新从 ModelScope
+> 下载（而非拷贝构建机产物），注意目录结构必须一致——两个必需文件直接位于目录
+> 根部，**不要套双层目录**（`.../speech_campplus_sv_zh-cn_16k-common/speech_campplus_sv_zh-cn_16k-common/` 为错误结构，启动时找不到权重即报错）。
 
 ### 5.3 冒烟验证（镜像内依赖完整性，可选但推荐）
 

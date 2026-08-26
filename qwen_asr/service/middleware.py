@@ -698,6 +698,12 @@ class TranscriptionsMiddleware:
             # （--diarization-min/max-speakers；spec「说话人数约束服务级默认」）
             req_min = _parse_optional_int(form.get("min_speakers"))
             req_max = _parse_optional_int(form.get("max_speakers"))
+            # 请求级取值校验（对齐服务级 ≥1 约束）：pyannote 的 set_num_speakers
+            # 对 0 走 falsy 兜底为 1，但负数原样透传到聚类层（n_clusters 为负
+            # 抛异常），须在边界拦截为 400
+            for label, value in (("min_speakers", req_min), ("max_speakers", req_max)):
+                if value is not None and value < 1:
+                    raise ValueError(f"{label} 须为不小于 1 的整数（收到: {value}）")
             min_speakers = req_min if req_min is not None else ext.diarization_min_speakers
             max_speakers = req_max if req_max is not None else ext.diarization_max_speakers
             if None not in (min_speakers, max_speakers) and min_speakers > max_speakers:

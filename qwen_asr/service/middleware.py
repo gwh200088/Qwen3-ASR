@@ -444,16 +444,35 @@ def _run_asr_align(
 
     aligned: List[Any] = []
     coarse_chunks: List[Tuple[str, float, float]] = []
+    # 逐块空 items 兜底的块索引集合（供 Change 2 覆盖率双保险去重；
+    # 整批异常和 merged is None 重建路径的块不进此集合——既有行为不变）
+    coarse_idx_set: set = set()
     # batch 元素：(块序号, cwav, 文本, 语言, offset)——序号供失败告警定位
     batch: List[Tuple[int, Any, str, str, float]] = []
 
     def _flush_align_batch() -> None:
-        nonlocal batch
+        nonlocal batch, coarse_idx_set
         if not batch:
             return
         payload = [(cwav, txt, lang, off) for _, cwav, txt, lang, off in batch]
         try:
-            aligned.extend(_align_batch(ext, payload))
+            # 先拿逐块结果做空 items 检测（重构目的是拿到逐块结果做容错检测；
+            # 非避免重复调用——原代码本来就只调用一次）
+            batch_results = _align_batch(ext, payload)
+            aligned.extend(batch_results)
+            # 逐块空 items 检测（Change 1）：result is None 或 items 为空 → 走粗粒度兜底
+            # aligner 对某块返回空 items 不抛异常，既有 try/except 只捕获整批异常，
+            # 该块文本会进 full_text 但无时间戳，成为孤儿文本——punctuation 模式下
+            # 游标 find 跳过，不形成独立 segment 段。此处兜底确保独立 coarse 段产出。
+            for (idx, cwav, txt, _, offset), result in zip(batch, batch_results):
+                if result is None or not list(result.items):
+                    start, end = _coarse_interval(cwav, offset)
+                    coarse_chunks.append((txt, start, end))
+                    coarse_idx_set.add(idx)
+                    logger.warning(
+                        "块 %s 对齐产出空 items，走粗粒度兜底（文本长度 %d，区间 [%.2fs, %.2fs)）",
+                        idx, len(txt), start, end,
+                    )
         except Exception as exc:
             if _cancelled():
                 # 客户端断连：取消语义优先，不被逐块容错吞掉
@@ -461,6 +480,7 @@ def _run_asr_align(
             for idx, cwav, txt, _, offset in batch:
                 start, end = _coarse_interval(cwav, offset)
                 coarse_chunks.append((txt, start, end))
+                coarse_idx_set.add(idx)  # 供 Change 2 覆盖率双保险去重
             logger.warning(
                 "对齐 batch 异常，块 %s 走粗粒度兜底: %s",
                 [item[0] for item in batch],
@@ -479,6 +499,23 @@ def _run_asr_align(
     _flush_align_batch()
 
     merged = merge_align_results([r for r in aligned if r is not None])
+    # 覆盖率双保险（Change 2）：merged 非空时检查每个非空文本块是否被覆盖。
+    # 已知局限（防御性校验）：前一块幻觉超长 end_time 跨入本块会误判覆盖，
+    # 理论上不应发生；空 items 块由 Change 1 兜底（不产生幻觉时间戳）。
+    if merged is not None:
+        item_starts = [float(it.start_time) for it in merged.items]
+        for idx, (cwav, txt, _, offset) in enumerate(per_chunk):
+            if not txt.strip():
+                continue
+            c_start, c_end = _coarse_interval(cwav, offset)
+            # 左闭右开 [offset, offset+块长)：start_time 恰好等于块终点算下一块
+            is_covered = any(c_start <= s < c_end for s in item_starts)
+            if not is_covered and idx not in coarse_idx_set:
+                coarse_chunks.append((txt, c_start, c_end))
+                logger.warning(
+                    "对齐覆盖率校验：块 %s [%.2fs, %.2fs) 未被 item 覆盖，补进粗粒度兜底",
+                    idx, c_start, c_end,
+                )
     if merged is None:
         # 对齐结果全空（全块失败或逐块均未产出 item）：全部非空文本块整体
         # 走块级粗粒度兜底（而非返回空 segments；spec「失败块与全空对齐的
@@ -488,7 +525,27 @@ def _run_asr_align(
             for (cwav, txt, _, offset) in per_chunk
             if txt.strip()
         ]
-    return full_text, merged_lang, merged, coarse_chunks
+    # 基于块索引精确计算每个 coarse 块的字符区间（Change 4）。
+    # coarse 条目 → 块索引映射：_coarse_interval 返回的 start 就是 offset
+    # 原值（min 截断只作用于 end），用 start == offset 反查块索引。
+    # 不用 coarse_idx_set（后者只含 Change 1 的块，会漏整批异常和
+    # merged is None 重建路径的块）。
+    coarse_char_spans: List[Tuple[int, int]] = []
+    for txt, start, end in coarse_chunks:
+        chunk_idx = None
+        for i, (_, _, _, offset) in enumerate(per_chunk):
+            if abs(start - offset) < 1e-9:
+                chunk_idx = i
+                break
+        if chunk_idx is not None:
+            char_start = sum(len(per_chunk[j][1]) for j in range(chunk_idx))
+            char_end = char_start + len(per_chunk[chunk_idx][1])
+            coarse_char_spans.append((char_start, char_end))
+        else:
+            # 反查失败（理论上不应发生），占位 -1 被 pipeline 的 if s >= 0
+            # 过滤——该块标点不排除（无实际影响，反查不应失败）
+            coarse_char_spans.append((-1, -1))
+    return full_text, merged_lang, merged, coarse_chunks, coarse_char_spans
 
 
 def _run_diarize(ext: ExtensionState, wav: Any, min_speakers: Optional[int], max_speakers: Optional[int]) -> List[Any]:
@@ -854,7 +911,7 @@ class TranscriptionsMiddleware:
             if isinstance(result, BaseException):
                 raise result
 
-        (full_text, language, merged_align, coarse_chunks), diar_results = results
+        (full_text, language, merged_align, coarse_chunks, coarse_char_spans), diar_results = results
         align_items = list(merged_align.items) if merged_align is not None else []
         diar_segments = diar_results[0].segments if diar_results else []
         process_time = time.perf_counter() - start  # 含排队等待
@@ -872,5 +929,6 @@ class TranscriptionsMiddleware:
             coarse_chunks=coarse_chunks,
             punctuation_split=bool(ext.punctuation_split),
             segment_split_mode=str(ext.segment_split_mode or "punctuation"),
+            coarse_char_spans=coarse_char_spans,
         )
         await _send_json(send, 200, response)

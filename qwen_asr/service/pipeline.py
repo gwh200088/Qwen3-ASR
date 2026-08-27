@@ -582,6 +582,7 @@ def build_segment_response(
     coarse_chunks: Optional[List[Tuple[str, float, float]]] = None,
     punctuation_split: bool = True,
     segment_split_mode: str = "punctuation",
+    coarse_char_spans: Optional[List[Tuple[int, int]]] = None,
 ) -> dict:
     """构建 segment 模式响应 dict（纯函数，无副作用）。
 
@@ -620,6 +621,11 @@ def build_segment_response(
         末尾、末段追加全文尾部句末标点；False 时跳过硬边界计算，纯间隙/
         段长（word 模式含说话人变化）切分（``segment_split_mode`` 被忽略，
         由 serve 启动校验输出组合告警），段文本截取行为不变。
+    :param coarse_char_spans: 每个粗段在 ``full_text`` 中的精确字符区间
+        ``[(char_start, char_end), ...]``，与 ``coarse_chunks`` 一一对应。
+        None 时 pipeline 用 ``coarse_text`` 在 ``full_text`` 中游标 ``find``
+        计算（双保险兜底）。用途：末段尾部标点追加逻辑排除粗段字符区间，
+        避免尾部空 items 块的标点被重复追加到正常段（P0 修复）。
     """
     turns = _to_turns(diarization)
     items = [
@@ -738,13 +744,36 @@ def build_segment_response(
             })
             dominant_records.append((speaker, seg_end - seg_start))
 
-    # ---- 末段尾部句末标点追加（v3）------------------------------------------
+    # ---- 末段尾部句末标点追加（v3 + P0 修复）-------------------------------
     # 末词匹配终点之后的句末标点不属于任何 between-span，不追加则全文以
     # 句末标点结尾时末段丢标点（拼接无损失效）；匹配失败回退 /
-    # punctuation_split=False 时不追加。粗段不参与（其 text 取块 ASR 原文，
-    # 含自身标点），故在粗段混入前对最后产出的正常段追加。
+    # punctuation_split=False 时不追加。
+    # P0 修复：尾部空 items 块进 coarse 后，其文本含句末标点；若 tail 不排除
+    # coarse 字符区间，会把粗段标点追加到正常段末尾，与粗段自身 text 标点
+    # 重复，破坏拼接无损。此处跳过 coarse 块覆盖的字符区间。
+    # 粗段不参与（其 text 取块 ASR 原文，含自身标点），故在粗段混入前对
+    # 最后产出的正常段追加。
+    # 确定 coarse 字符区间：优先用 middleware 提供的精确区间（coarse_char_spans）；
+    # 为 None 时用 coarse_text 在 full_text 中游标 find 计算（双保险兜底，
+    # 按 start 排序避免乱序错位——Change 2 补进的块追加在末尾不保证时间升序）。
+    if coarse_char_spans is not None:
+        coarse_char_ranges = [(s, e) for s, e in coarse_char_spans if s >= 0]
+    elif coarse:
+        coarse_char_ranges = []
+        pos = 0
+        for coarse_text, _, _ in sorted(coarse, key=lambda c: c[1]):
+            idx = full_text.find(coarse_text, pos)
+            if idx >= 0:
+                coarse_char_ranges.append((idx, idx + len(coarse_text)))
+                pos = idx + len(coarse_text)
+    else:
+        coarse_char_ranges = []
     if matched and last_end >= 0 and segments:
-        tail = "".join(ch for ch in full_text[last_end:] if ch in _SENTENCE_END_CHARS)
+        tail = "".join(
+            ch for i, ch in enumerate(full_text[last_end:])
+            if ch in _SENTENCE_END_CHARS
+            and not any(s <= last_end + i < e for s, e in coarse_char_ranges)
+        )
         if tail:
             segments[-1]["text"] += tail
 
@@ -1655,5 +1684,49 @@ def self_test() -> None:
         assert segs[0]["text"] == "甲" and segs[2]["text"] == "乙"
         assert segs[1]["text"] == "失败块文本"  # 粗段取块 ASR 原文（仅计入一次）
         assert "".join(s["text"] for s in segs) == resp["text"]  # 交界无标点 → 拼接一致
+
+    # ---- 19. P0 修复：尾部空 items 块标点不重复（coarse_char_spans 精确区间）--
+    # 尾部空 items 块进 coarse 后，其文本含句末标点；tail 逻辑须排除 coarse
+    # 字符区间，否则会把粗段标点追加到正常段末尾，与粗段自身标点重复。
+    # 场景：正常块"甲" + 尾部空 items 块"乙说完了。"
+    # 精确区间：coarse_char_spans=[(1, 6)]（"甲"1 字符，"乙说完了。"5 字符）
+    resp = build_segment_response(
+        align_items=[ali("甲", 0.0, 1.0)],
+        diarization=[],
+        full_text="甲乙说完了。",
+        language_name="Chinese",
+        duration=3.0,
+        coarse_chunks=[("乙说完了。", 1.5, 3.0)],
+        coarse_char_spans=[(1, 6)],
+    )
+    segs = resp["segments"]
+    assert [(s["start"], s["end"]) for s in segs] == [(0.0, 1.0), (1.5, 3.0)]
+    assert segs[0]["text"] == "甲"  # tail 排除 coarse 区间，不追加尾部标点
+    assert segs[1]["text"] == "乙说完了。"  # 粗段含自身标点
+    assert "".join(s["text"] for s in segs) == resp["text"]  # 拼接无损
+
+    # 同场景不传 coarse_char_spans（None → pipeline find 兜底）
+    resp = build_segment_response(
+        align_items=[ali("甲", 0.0, 1.0)],
+        diarization=[],
+        full_text="甲乙说完了。",
+        language_name="Chinese",
+        duration=3.0,
+        coarse_chunks=[("乙说完了。", 1.5, 3.0)],
+    )
+    segs = resp["segments"]
+    assert segs[0]["text"] == "甲"  # find 兜底同样排除 coarse 区间
+    assert segs[1]["text"] == "乙说完了。"
+    assert "".join(s["text"] for s in segs) == resp["text"]
+
+    # 无 coarse 块时 tail 行为不变（既有行为回归）
+    resp = build_segment_response(
+        align_items=[ali("甲", 0.0, 1.0)],
+        diarization=[],
+        full_text="甲。",
+        language_name="Chinese",
+        duration=1.0,
+    )
+    assert resp["segments"][0]["text"] == "甲。"  # tail 取末尾句号
 
     print("pipeline self_test ok")

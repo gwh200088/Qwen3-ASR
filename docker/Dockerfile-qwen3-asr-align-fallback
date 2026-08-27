@@ -1,28 +1,30 @@
-# punct2 镜像：基于已构建的 qwen3-asr-offline:cu128-punct（hotfix 热修 + 标点感知
-# 分段 v1），全量覆盖 qwen_asr/ 包代码（不重装依赖、不重打大镜像）。
+# align-fallback 镜像：基于已构建的 qwen3-asr-offline:cu128-punct（hotfix 热修 +
+# 标点感知分段 v1 + diarization 调参 + CAM++ 中文声纹），全量覆盖 qwen_asr/ 包代码
+#（不重装依赖、不重打大镜像）。
 #
-# 本版新增（feat/punct-split-diarization-tuning 分支，详见
-# .trae/specs/add-punct-split-mode-and-diarization-tuning/spec.md）：
-#   1. --segment-split-mode {punctuation, hybrid}（默认 punctuation）：纯标点切分，
-#      忽略静音间隙与说话人变化，修复"一句话被拆成两段"；--segment-gap-threshold
-#      与 --speaker-merge-gap 仅 hybrid 模式生效；跨失败块边界强制切分修复
-#      段文本截入失败块文本的遗留问题；
-#   2. --diarization-min/max-speakers 说话人数约束（服务级默认，请求级可覆盖）
-#      与 --diarization-clustering-threshold 聚类阈值调参；
-#   3. --diarizer-embedding {wespeaker, campplus} + --diarizer-embedding-model：
-#      CAM++ 中文声纹（ModelScope speech_campplus_sv_zh-cn_16k-common，外部挂载）
-#      加载后组件替换注入 + 3.1 式 AHC 余弦聚类，缓解中文男声相近被合并。
+# 本版新增（fix-align-empty-items-fallback spec，详见
+# .trae/specs/fix-align-empty-items-fallback/spec.md）：
+#   1. 对齐逐块空 items 兜底（Change 1）：_flush_align_batch 内逐块检测
+#      ForcedAlignResult(items=[])，空块进 coarse_chunks + coarse_idx_set，
+#      确保孤儿文本产出独立 coarse 段（修复"清晰语句无 segment 段"）；
+#   2. 对齐覆盖率双保险（Change 2）：merged 非空时检查每个非空文本块是否被
+#      item 时间戳覆盖，未覆盖块补进 coarse_chunks（coarse_idx_set 去重防重复）；
+#   3. 末段尾部标点排除 coarse 字符区间（Change 3 / P0 修复）：tail 逻辑排除
+#      coarse 块覆盖的字符区间，避免尾部空 items 块标点被重复追加到正常段
+#      （pipeline tail 逻辑改 + middleware 提供 coarse_char_spans 精确区间双保险）；
+#   4. 整批异常块加入 coarse_idx_set（P0 修复）：except 分支也 add(idx)，
+#      防止部分成功 + 整批异常场景下 Change 2 重复兜底。
 #
 # 覆盖方式：删除基础镜像内旧版包代码目录后，以本地仓库 qwen_asr/ 完整替换——
 # 镜像内代码与本地一字不差，无旧文件残留。pip dist-info 安装元数据（RECORD 哈希）
 # 不随覆盖更新，不影响运行时 import 与服务启动（与既有 punct/hotfix 镜像做法一致）。
 #
 # 本机构建（在仓库根目录执行，构建上下文仅需 qwen_asr/ 目录）：
-#   docker build -f docker/Dockerfile-qwen3-asr-punct2 -t qwen3-asr-offline:cu128-punct2 .
+#   docker build -f docker/Dockerfile-qwen3-asr-align-fallback -t qwen3-asr-offline:cu128-align-fallback .
 #
 # 目标机构建（免重传基础镜像）：把本文件与整个 qwen_asr/ 目录放到目标机
 #   /data/patch/{Dockerfile, qwen_asr/...}，
-#   cd /data/patch && docker build -t qwen3-asr-offline:cu128-punct2 .
+#   cd /data/patch && docker build -t qwen3-asr-offline:cu128-align-fallback .
 #   （目标机已有基础镜像 qwen3-asr-offline:cu128-punct，仅需传输 ~600KB 源文件）
 FROM qwen3-asr-offline:cu128-punct
 
@@ -35,7 +37,7 @@ COPY qwen_asr/ /usr/local/lib/python3.10/dist-packages/qwen_asr/
 
 # 构建期校验：全量语法编译（防截断文件进镜像；顺带生成 __pycache__ 字节码）
 # + pipeline 分段逻辑离线自测（self_test 纯标准库、无 GPU 依赖，覆盖 punctuation/
-#   hybrid 两模式断言组与跨失败块强制切分回归；importlib 按路径加载绕过包
-#   __init__ 的 torch/vllm 重依赖 import，秒级完成）
+#   hybrid 两模式断言组 + 跨失败块强制切分回归 + P0 尾部空 items 标点不重复；
+#   importlib 按路径加载绕过包 __init__ 的 torch/vllm 重依赖 import，秒级完成）
 RUN python3 -m compileall -q /usr/local/lib/python3.10/dist-packages/qwen_asr \
  && python3 -c "import importlib.util; spec = importlib.util.spec_from_file_location('punct_pipeline', '/usr/local/lib/python3.10/dist-packages/qwen_asr/service/pipeline.py'); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); m.self_test()"

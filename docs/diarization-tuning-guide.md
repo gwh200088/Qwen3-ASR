@@ -1,6 +1,7 @@
 # 说话人识别（diarization）调优指南
 
-> 适用范围：`qwen3-asr-offline:cu128-punct2` 及之后镜像，segment 模式（`timestamp_granularities[]=segment`）。
+> 适用范围：`qwen3-asr-offline:cu128-align-fallback` 镜像（及之后的叠加层），segment 模式（`timestamp_granularities[]=segment`）。
+> 配套文档：`docs/deployment-guide.md`（部署操作手册，§2.4 CAM++ 与 §6.3 参数表）。
 > 本文仅涉及**启动参数调整**，不含代码改动。
 
 ## 1. 问题定位：说话人错归类的三个层面

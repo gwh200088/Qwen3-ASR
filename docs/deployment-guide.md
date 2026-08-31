@@ -1,8 +1,11 @@
 # Qwen3-ASR segment 时间戳 + 说话人识别服务 · 部署操作手册
 
-> 推荐镜像：`qwen3-asr-offline:cu128-punct2`（punct + 纯标点切分模式 + 说话人调参与 CAM++ 中文声纹，2026-08-24 容器内全量验证通过）
-> 上一代镜像：`qwen3-asr-offline:cu128-punct`（标点感知分段 v1）；`qwen3-asr-offline:cu128-hotfix`（基础镜像 + 3 项实机运行时修复）
+> 推荐镜像：`qwen3-asr-offline:cu128-align-fallback`（= punct2 + 对齐逐块空 items 兜底 + **文本优先切分解耦**，见 §2.5）
+> 上一代镜像：`qwen3-asr-offline:cu128-punct2`（纯标点切分模式 + 说话人调参 + CAM++ 中文声纹，2026-08-24 容器内全量验证通过）；`qwen3-asr-offline:cu128-punct`（标点感知分段 v1）；`qwen3-asr-offline:cu128-hotfix`（基础镜像 + 3 项实机运行时修复）
 > 基础镜像：`qwen3-asr-offline:cu128`（基于 `dev` 分支构建，`BUNDLE_FLASH_ATTENTION=false`）
+>
+> **镜像 tag 说明**：本版沿用 `cu128-align-fallback` 这个 tag 名（构建时未改名），但其内容除对齐兜底修复外，还包含 §2.5 的文本优先切分重构。若构建时使用了其他 tag，全文镜像名请对应替换。
+> **说话人识别调优**（CAM++ / 人数约束 / 聚类阈值）另见 `docs/diarization-tuning-guide.md`。
 > 部署模式：**完全离线**（模型本地目录挂载，全程零网络）
 > 服务能力：vLLM ASR 转写 + segment 级时间戳（强制对齐）+ pyannote 说话人识别，支持最长 1 小时音频
 
@@ -29,7 +32,8 @@
 | `qwen3-asr-offline:cu128` | 基础镜像（Dockerfile-qwen3-asr-cu128 完整构建） | 构建产物基座 |
 | `qwen3-asr-offline:cu128-hotfix` | 基础镜像 + 3 个运行时修复（Dockerfile-qwen3-asr-hotfix，§2.1） | 历史版本 |
 | `qwen3-asr-offline:cu128-punct` | hotfix + 标点感知分段 v1（Dockerfile-qwen3-asr-punct，代码全量覆盖） | 上一代 |
-| `qwen3-asr-offline:cu128-punct2` | punct + 纯标点切分模式 + 说话人调参 + CAM++ 中文声纹（Dockerfile-qwen3-asr-punct2，代码全量覆盖，§2.4） | **生产部署用这个** |
+| `qwen3-asr-offline:cu128-punct2` | punct + 纯标点切分模式 + 说话人调参 + CAM++ 中文声纹（Dockerfile-qwen3-asr-punct2，代码全量覆盖，§2.4） | 上一代 |
+| `qwen3-asr-offline:cu128-align-fallback` | punct2 + 对齐逐块空 items 兜底 + **文本优先切分解耦**（Dockerfile-qwen3-asr-align-fallback，代码全量覆盖，§2.5） | **生产部署用这个** |
 
 ### 2.1 hotfix 镜像包含的修复（2026-08-20 GPU 实机首跑发现）
 
@@ -40,6 +44,9 @@
 | fix3 | `middleware.py`：segment 任务收尾在调度许可释放前 `torch.cuda.empty_cache()` 归还缓存分配器空闲块 | **首个请求 200 OK，之后所有请求永久排队**（详见 §11 故障排查 #3） |
 
 ### 2.2 镜像内容判别
+
+> **当前版本判别请用 §5.1 的命令**（检测 `_split_text_spans`，即 §2.5 的文本优先切分解耦）。
+> 以下为历史版本判别命令，仅在需要确认手上是不是老镜像时使用。
 
 ```bash
 # 判别是否 punct2（含 CAM++ wrapper 与切分模式参数）：
@@ -98,7 +105,7 @@ docker run -d --name qwen3-asr --restart unless-stopped \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
   -v /data/models:/models:ro \
-  qwen3-asr-offline:cu128-punct2 \
+  qwen3-asr-offline:cu128-align-fallback \
   qwen-asr-serve /models/Qwen3-ASR-1.7B --served-model-name qwen3-asr \
     --host 0.0.0.0 --port 80 \
     --forced-aligner /models/Qwen3-ForcedAligner-0.6B \
@@ -115,14 +122,65 @@ docker run -d --name qwen3-asr --restart unless-stopped \
 
 ```bash
 # 本机构建（仓库根目录）：
-docker build -f docker/Dockerfile-qwen3-asr-punct2 -t qwen3-asr-offline:cu128-punct2 .
+docker build -f docker/Dockerfile-qwen3-asr-align-fallback \
+  -t qwen3-asr-offline:cu128-align-fallback .
 
 # 目标机轻量构建（免重传基础镜像，推荐）：把 Dockerfile 与整个 qwen_asr/ 目录
 # 传到目标机 /data/patch/，目标机已有 qwen3-asr-offline:cu128-punct 时：
-cd /data/patch && docker build -t qwen3-asr-offline:cu128-punct2 .
+cd /data/patch && docker build -t qwen3-asr-offline:cu128-align-fallback .
 ```
 
+> **基础镜像是 `qwen3-asr-offline:cu128-punct`（不是 punct2）**——本 Dockerfile 的
+> `FROM` 指向 punct，且采用"全量覆盖 `qwen_asr/`"（先删旧包目录再整体复制），
+> 因此不依赖上一层是否为 punct2。目标机若只有 punct2 而没有 punct，可用
+> `docker tag qwen3-asr-offline:cu128-punct2 qwen3-asr-offline:cu128-punct`
+> 临时补一个别名后再构建。
+
 **CAM++ A/B 实测结论**（东北话两男真实音频，wespeaker vs campplus）：**待部署机实测后回填**（当前构建机仅完成 CPU 前向冒烟与示例音频判别验证；部署机 A/B 结论将决定 `--diarizer-embedding` 默认值是否切换为 campplus）。
+
+### 2.5 align-fallback 镜像新增能力（分支 feat/punct-split-diarization-tuning）
+
+本镜像在 punct2 之上全量覆盖 `qwen_asr/` 代码（依赖不变、层级叠加），包含两组改动。
+
+**A. 对齐逐块空 items 兜底（`.trae/specs/fix-align-empty-items-fallback`）**
+
+修复"对话中能听清的语句，结果里却找不到对应 segment 段"：
+
+- 对齐器对某块返回空 items 时（不抛异常、也不是整批失败），该块此前会成为"孤儿文本"——进全文但无时间戳，也不产出独立段。现在逐块检测并产出独立的粗粒度兜底段；
+- 覆盖率双保险：对齐结果合并后，检查每个非空文本块是否被 item 时间戳覆盖，未覆盖的块补进兜底（块索引去重，防重复）；
+- 尾部空 items 块的句末标点不再被重复追加到前一段（标点字符区间精确排除）。
+
+**B. 文本优先切分解耦（`.trae/specs/text-first-segmentation`，本次主体改动）**
+
+修复"**有句末标点却不切分，整段文字聚成一个超长 segment**"：
+
+- **根因**：切点此前由对齐 token 序列推导——greedy `find` 把每个 token 映射回全文，靠相邻匹配区间之间的文本判断有无句末标点。**只要有一个 token 匹配不上，就整体回退，整份音频的标点切分全部失效**，只剩 30s 段长强切。执法场景念证件号/车牌/金额时极易触发（对齐器会剥掉标点并合并拉丁数字串，例如 `三零二X。三零二X。` 被清洗成 token `XGTDCH`，在原文中找不到）。
+- **实测**：某 196.544s 执法音频，全文 815 字含 **75 个句末标点**，实际只切出 **7 段**（全部卡在 30s 上限），且拼接丢失 5 个字符。修复后为 **75 段**，最长段 **29.893s → 15.024s**，拼接无损。
+- **改法**：切分改由三层完成——
+  1. **文本层**：直接扫描全文按句末标点划分，粗段字符区间边界强制切分。不依赖对齐输出；
+  2. **时间映射层**：把对齐 item 映射回字符区间，**局部回退**——单个 token 匹配失败只损失它自己，不再牵连全局；
+  3. **段内细分**：文本段之内保留段长强切，以及 `hybrid` 模式的间隙/说话人变化切分。
+- **拼接无损由构造保证**：段文本从"截取"改为"划分"（`full_text[c_start:c_end]`），相邻区间首尾相接，因此 `"".join(segments[].text) == text` 恒成立，不再依赖标点追加/补偿逻辑。
+- **粗段也按标点切分**：此前一整块（最长 180s）只产出 1 段、段内标点完全不切；现在块内标点照常切分，各子区间时间按字符偏移线性分摊。
+
+**行为变化（升级时需知悉）**
+
+| # | 变化 | 说明 |
+|---|---|---|
+| 1 | 句末标点**之后**的空白归入前一段 | 此前该空白被丢弃（破坏拼接无损）。现在段文本可能以空格结尾，如 `"Hello, world. "` |
+| 2 | 粗粒度兜底段按内部标点切分 | 不再是整块单段；断言 `segments` 数量的下游逻辑需复核 |
+| 3 | 原"标点匹配失败 → 整体回退"路径取消 | 不再出现"约 30s 均匀粗块"的退化症状 |
+
+**已知局限**：粗段内部**完全没有**句末标点时，仍产出与块等长的单段（最长 180s）。这是刻意为之——粗段的时间戳本就是线性估算，再按段长切碎只会制造虚假精度。详见 §12。
+
+**验证结论**（构建机离线验证，可复现）：
+
+```
+self_test                                    通过（含新增第 20 组脱敏回归）
+mock 端到端（驱动真实 _run_asr_align）        13/13 通过，原失败的 4 个粗段用例转为拼接无损
+真实案例文本                                  段数 7 → 75，最长段 29.893s → 15.024s，拼接无损
+性能                                         8800 字 / 8000 items 构建耗时 ~11ms
+```
 
 ---
 
@@ -177,11 +235,22 @@ ls /data/models/speech_campplus_sv_zh-cn_16k-common
 ### 5.1 导入镜像
 
 ```bash
-docker load < qwen3-asr-offline-cu128-punct2.tar.gz
-# 预期末尾：Loaded image: qwen3-asr-offline:cu128-punct2
+docker load < qwen3-asr-offline-cu128-align-fallback.tar.gz
+# 预期末尾：Loaded image: qwen3-asr-offline:cu128-align-fallback
 
 docker images | grep qwen3-asr-offline   # 确认存在
 ```
+
+**导入后立即判别镜像内容**（确认是本次版本，避免误用旧镜像）：
+
+```bash
+docker run --rm --entrypoint sh qwen3-asr-offline:cu128-align-fallback -c \
+  "grep -c '_split_text_spans' \
+     /usr/local/lib/python3.10/dist-packages/qwen_asr/service/pipeline.py"
+# 输出 ≥ 1 = 含文本优先切分解耦（§2.5）；报错或输出 0 = 旧镜像
+```
+
+> 若上一步判别为旧镜像，或需回退，见 §9 运维表的"更新代码 / 回滚"两行。
 
 ### 5.2 解包模型
 
@@ -206,7 +275,7 @@ tar xzf qwen3-asr-models.tar.gz -C /data/models
 ### 5.3 冒烟验证（镜像内依赖完整性，可选但推荐）
 
 ```bash
-docker run --rm qwen3-asr-offline:cu128-punct2 python3 -c "
+docker run --rm qwen3-asr-offline:cu128-align-fallback python3 -c "
 import warnings; warnings.filterwarnings('ignore')
 import vllm, pyannote.audio, transformers, torchcodec, torch
 from qwen_asr.service.middleware import TranscriptionsMiddleware
@@ -227,7 +296,7 @@ docker run -d --name qwen3-asr --restart unless-stopped \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
   -v /data/models:/models:ro \
-  qwen3-asr-offline:cu128-punct2 \
+  qwen3-asr-offline:cu128-align-fallback \
   qwen-asr-serve /models/Qwen3-ASR-1.7B --served-model-name qwen3-asr \
     --host 0.0.0.0 --port 80 \
     --forced-aligner /models/Qwen3-ForcedAligner-0.6B \
@@ -240,8 +309,10 @@ docker run -d --name qwen3-asr --restart unless-stopped \
 
 > **`--max-num-batched-tokens 8192` 必须加**：vLLM 默认值 2048 会导致长音频请求停滞卡死（详见 §11 #2），该参数是本次实机调试确认的关键修复。
 
-> 上述命令已含 punct2 全部默认行为（punctuation 切分模式 + wespeaker 声纹），无需额外参数。
-> **中文双人对话场景推荐**（相近男声被合并时，参数追加在 `qwen-asr-serve` 命令尾部，见 §2.4）：
+> **启动后请执行 §7.4 的三项切分质量校验**（拼接无损 / 段数与最长段 / 兜底块日志）。
+
+> 上述命令已含本版全部默认行为（punctuation 切分模式 + wespeaker 声纹），无需额外参数。
+> **中文双人对话场景推荐**（相近男声被合并时，参数追加在 `qwen-asr-serve` 命令尾部，见 §2.4 与 `docs/diarization-tuning-guide.md`）：
 >
 > ```bash
 >     --diarization-min-speakers 2 --diarization-max-speakers 2 \
@@ -356,7 +427,7 @@ docker run -d --name qwen3-asr --restart unless-stopped \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
   -v /data/models:/models:ro \
-  qwen3-asr-offline:cu128-punct2 \
+  qwen3-asr-offline:cu128-align-fallback \
   qwen-asr-serve /models/Qwen3-ASR-1.7B --served-model-name qwen3-asr \
     --host 0.0.0.0 --port 80 \
     --forced-aligner /models/Qwen3-ForcedAligner-0.6B \
@@ -365,6 +436,40 @@ docker run -d --name qwen3-asr --restart unless-stopped \
     --gpu-memory-utilization 0.90 \
     --max-num-batched-tokens 8192
 ```
+
+**两卡参考配置（执法记录仪场景，含说话人调优）：**
+
+```bash
+docker run --security-opt seccomp=unconfined -d --name qwen3-asr \
+  --restart unless-stopped \
+  --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1 \
+  --shm-size 8g -p 8000:80 \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
+  -v /data/models:/models:ro \
+  qwen3-asr-offline:cu128-align-fallback \
+  qwen-asr-serve /models/Qwen3-ASR-1.7B --served-model-name qwen3-asr \
+    --host 0.0.0.0 --port 80 \
+    --forced-aligner /models/Qwen3-ForcedAligner-0.6B \
+    --diarizer /models/pyannote-speaker-diarization-community-1 \
+    --diarization-min-speakers 2 \
+    --diarization-clustering-threshold 0.5 \
+    --aligner-device cuda:1 --diarizer-device cuda:1 \
+    --gpu-memory-utilization 0.90 \
+    --max-num-batched-tokens 8192
+```
+
+> 说明：该拓扑用旧版 Docker 的 `--runtime=nvidia` + `NVIDIA_VISIBLE_DEVICES` 写法
+> （Docker ≥19.03 可用 `--gpus '"device=0,1"'`，见本节末）。
+>
+> **此配置有两点建议调整**（详见 `docs/diarization-tuning-guide.md`）：
+>
+> 1. `--diarization-min-speakers 2` 未配上界 → 单人独白会被**强行劈成两类**。
+>    人数固定时补 `--diarization-max-speakers 2`；人数不定则去掉下限，改由请求级参数指定。
+> 2. `--diarization-clustering-threshold 0.5` **必须先确认生效**：
+>    `docker logs qwen3-asr 2>&1 | grep -E "聚类阈值"`
+>    出现"聚类阈值已覆写（生效机制: …）"才算生效；出现"应用失败"则该参数无效，
+>    正按管线默认阈值运行。即便生效也建议 A/B 确认方向（调低更倾向拆分）。
 
 **三卡（各自独占，显存互不竞争）：**
 
@@ -382,7 +487,7 @@ docker run -d --name qwen3-asr --restart unless-stopped \
   -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
   -e OMP_NUM_THREADS=8 \
   -v /data/models:/models:ro \
-  qwen3-asr-offline:cu128-punct2 \
+  qwen3-asr-offline:cu128-align-fallback \
   qwen-asr-serve /models/Qwen3-ASR-1.7B --served-model-name qwen3-asr \
     --host 0.0.0.0 --port 80 \
     --tensor-parallel-size 2 \
@@ -434,7 +539,7 @@ docker run -d --name qwen3-asr --restart unless-stopped \
 ```
 
   后 `systemctl restart docker`
-- 验证（离线可用）：`docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 qwen3-asr-offline:cu128-punct2 nvidia-smi` 应列出全部目标卡
+- 验证（离线可用）：`docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 qwen3-asr-offline:cu128-align-fallback nvidia-smi` 应列出全部目标卡
 - 注意：若 Docker ≥19.03 报 `could not select device driver "" with capabilities: [[gpu]]`，是**未装 nvidia-container-toolkit** 而非版本不支持，安装后继续用 `--gpus` 即可
 - `docker load` 加载本镜像 tar 在 18.x 上兼容（save/load 格式早已定型），不受影响
 
@@ -538,6 +643,65 @@ docker exec qwen3-asr python3 /data/shared/Qwen3-ASR/examples/example_segment_ap
 
 > 注意容器内端口是 **80**（不是宿主机映射的 8000）。
 
+### 7.4 切分质量验证（本版新增，升级后必做）
+
+本版改动了切分机制（§2.5），部署后建议对一条真实音频做三项校验，确认效果符合预期。
+
+**校验 1：拼接无损**（`segments[].text` 拼接应等于 `text` 全文字段）
+
+```bash
+docker exec qwen3-asr python3 -c "
+import json, requests
+r = requests.post('http://127.0.0.1:80/v1/audio/transcriptions',
+    files={'file': open('/tmp/test.wav','rb')},
+    data={'model':'qwen3-asr','timestamp_granularities[]':'segment'}, timeout=900)
+d = r.json()
+joined = ''.join(s['text'] for s in d['segments'])
+print('段数       :', len(d['segments']))
+print('全文长度   :', len(d['text']))
+print('拼接长度   :', len(joined))
+print('拼接无损   :', joined == d['text'])
+"
+```
+
+预期：`拼接无损 : True`。若为 `False`，说明存在兜底块（见校验 3）或对齐异常，请记录段数与首尾差异后反馈。
+
+**校验 2：段数与最长段**（确认标点切分生效，不再出现超长段）
+
+```bash
+docker exec qwen3-asr python3 -c "
+import json, requests
+r = requests.post('http://127.0.0.1:80/v1/audio/transcriptions',
+    files={'file': open('/tmp/test.wav','rb')},
+    data={'model':'qwen3-asr','timestamp_granularities[]':'segment'}, timeout=900)
+d = r.json()
+segs = d['segments']
+n_punct = sum(1 for c in d['text'] if c in '。！？；.!?;\n')
+mx = max((s['end']-s['start'] for s in segs), default=0)
+print('全文句末标点数 :', n_punct)
+print('实际段数       :', len(segs))
+print('最长段时长(s)  :', round(mx, 3))
+"
+```
+
+判读：
+
+- **段数接近句末标点数量级** → 标点切分正常生效；
+- **段数远小于标点数，且最长段接近 30s**（`--max-segment-seconds` 默认值）→ 异常，反馈排查；
+- **最长段接近 180s** → 命中 §12 的已知局限（粗段内部无标点），属预期，可忽略或按 §12 处理。
+
+**校验 3：兜底块触发情况**（看是否有对齐块回退到粗粒度兜底）
+
+```bash
+docker logs qwen3-asr 2>&1 | grep -E "粗粒度兜底|未被 item 覆盖"
+```
+
+- 无输出 = 所有对齐块均正常，无需关注；
+- 有输出 = 存在兜底块，日志含块序号与时间区间（如 `块 3 对齐产出空 items，走粗粒度兜底（文本长度 128，区间 [540.00s, 720.00s)）`）。偶发属正常容错（§8.3.2）；**频繁出现**说明 aligner 在该批音频上不稳定，建议记录并反馈。
+
+> 说话人识别相关验证（CAM++ 注入、人数约束、聚类阈值是否生效）见
+> `docs/diarization-tuning-guide.md` 第 4 节。
+
 ---
 
 ## 8. API 接口文档
@@ -630,25 +794,44 @@ docker exec qwen3-asr python3 /data/shared/Qwen3-ASR/examples/example_segment_ap
 
 #### 8.3.2 对齐逐块容错与粗段兜底（两种模式均生效）
 
-长音频按 180s 分块对齐，单个对齐块异常（OOM/音频异常等）**不再导致整请求 500**：
+长音频按 180s 分块对齐，单个对齐块异常**不再导致整请求 500，也不再丢失该块文本**。触发兜底的情形有三类：
 
-- 失败块的文本按块区间产出**粗粒度兜底段**（`start`/`end` 为块区间边界，speaker 按块区间投票，与正常段同构、无区分标记），其余块正常词级归属，日志记录失败块序号与异常摘要；
-- 所有对齐块全部失败但 ASR 文本正常时，每个非空文本块产出一个粗段（而非返回空 segments）；
+| # | 触发条件 | 兜底行为 |
+|---|---|---|
+| 1 | 整批对齐抛异常（OOM / GPU 报错） | 批内全部块走粗粒度兜底 |
+| 2 | **单块返回空 items**（不抛异常） | 该块走粗粒度兜底——此前这类块会成为"孤儿文本"：进全文但无时间戳，也不产出独立段，表现为"能听清的语句在结果里找不到对应 segment 段" |
+| 3 | 对齐结果合并后，某文本块未被任何 item 时间戳覆盖（覆盖率双保险） | 该块补进兜底（块索引去重，防重复） |
+
+兜底段特征：
+
+- 兜底块的文本按**块内句末标点**切分为多段（本版改进；此前整块只产出 1 段），各段 `start`/`end` 按字符偏移在块区间上线性分摊，speaker 按该子区间投票；
+- 所有对齐块全部失败但 ASR 文本正常时，每个非空文本块按上述方式产出粗段（而非返回空 segments）；
 - 正常段与粗段混合产出时 `segments[]` 仍按 `start` 全局升序，粗段不与任何段合并；
-- **精度限制**：粗段粒度为 180s 块级，段内无法定位切点；粗段整段时长计入投票主导的 speaker，次要说话人时长被整段吞掉——`totalDuration` 失真幅度大于段级投票，最长可达 180s；
-- **范围**：本容错仅覆盖对齐计算异常；ASR 分块生成异常仍按现状整请求失败（返回 500）。
+- 每次兜底都会输出 WARNING 日志（块序号 + 时间区间，第 2 类还含文本长度），可用 §7.4 校验 3 检索 `粗粒度兜底` / `未被 item 覆盖` 定位。
+
+**精度限制**：
+
+- 兜底段的**时间戳是按字符偏移线性估算**的（非对齐实测值），因此段级时间点仅供参考，不适合做逐字级定位；
+- 兜底段整段时长计入投票主导的 speaker，次要说话人时长被吞掉——`totalDuration` 失真幅度大于正常段；本版按标点切分后单一兜底段变短，失真幅度相应下降；
+- 兜底块内**完全没有**句末标点时仍为整块一段（最长 180s），见 §12。
+
+**范围**：本容错仅覆盖对齐环节；ASR 分块生成异常仍按现状整请求失败（返回 500）。
 
 #### 8.3.3 segment 切分规则（标点感知，双模式）
 
-segment 切分利用 ASR 文本自带的句末标点，切分维度由 `--segment-split-mode` 决定（两种归属模式均生效）：
+segment 切分利用 ASR 文本自带的句末标点，切分维度由 `--segment-split-mode` 决定（两种归属模式均生效）。
 
-**punctuation 模式（punct2 默认）**——只按标点与段长切分：
+> **本版核心变化（§2.5）**：切点**直接由全文文本扫描得出**，不再通过对齐 token
+> 序列推导。标点切分因此不再受对齐器输出质量影响——单个 token 匹配失败只会
+> 损失它自己的时间锚点，不会导致整份音频的标点切分失效。
+
+**punctuation 模式（默认）**——只按标点与段长切分：
 
 | # | 切分条件 | 说明 |
 |---|---|---|
-| 1 | 句末标点硬边界 | 相邻对齐词之间的全文文本含句末标点（`。！？；.!?;` 及换行）→ **恒切分，无视时间间隙**；`--punctuation-split off` 时关闭 |
+| 1 | 句末标点硬边界 | **扫描全文**：句末标点连续串（`。！？；.!?;` 及换行）**及其后空白**之后落切点 → **恒切分，无视时间间隙**；`--punctuation-split off` 时关闭 |
 | 2 | 段长 > `--max-segment-seconds` | 默认 30s 强切——**punctuation 模式下唯一的非标点切分来源** |
-| 3 | 跨对齐失败块边界 | 与失败块（§8.3.2）相交的边界**强制切分**——正常段不横跨失败块（两模式均生效） |
+| 3 | 跨对齐失败块边界 | 兜底块（§8.3.2）的字符区间边界**强制切分**——正常段不横跨兜底块文本（两模式均生效） |
 
 - **静音间隙与句中说话人变化均不触发切分**：一句话只要没有句末标点就不会被拆开（直接修复"一句话被拆成两段"）；代价是句中快速换人（无标点）时两人合入同一 segment，`speaker` 由段内词归属投票决定、`speakers` 为去重集合（§8.3.1）；
 - **逗号/顿号不是切分点**：`，、,` 保留段内，符合"一句话一个分段"；
@@ -666,20 +849,23 @@ segment 切分利用 ASR 文本自带的句末标点，切分维度由 `--segmen
 - **无标点间隙阈值 2.0s 语义**：句中 0.8~2.0s 自然停顿（无句末标点）不再切碎，长静音（≥ 2.0s）仍切分；ASR 不输出标点时全部边界按 2.0s 处理；
 - **同人聚合不跨越标点硬边界**：word 模式二次聚合遇句末标点硬边界不合并。
 
-**段文本句末标点归属**（`--punctuation-split on` 时，两种归属模式与两种切分模式均生效）：
+**段文本构成**（本版改为"划分"，两种归属模式与两种切分模式均适用）：
 
-- 切分处词间文本中的句末标点**附前段 `text` 末尾**：连续句末标点（如"？！"）全量追加，空格/引号等非句末标点字符不追加；
-- **末段追加全文尾部句末标点**：全文末词匹配终点之后的句末标点不属于任何词间区间，追加到末段 `text` 末尾，不丢失；
-- **跨对齐失败块边界不追加**：失败块（§8.3.2 粗段兜底）前后相邻词的词间文本含整块失败文本（最长 180s），其句末标点不拼入前段（避免垃圾后缀、避免与粗段原文标点重复）；切分由跨失败块强制切分保证（条件 3）；
-- **拼接无损**：对齐词文本全文匹配成功时，`segments[]` 按 `start` 排序后 `"".join(segments[].text) == text`（`text` 全文字段）——正常段携带词间标点 + 末段尾部标点，粗段取块 ASR 原文（含自身标点），混合场景同样成立。
+段文本即全文的原样切片 `full_text[c_start:c_end]`——切点落在句末标点连续串及其后空白之后，因此：
+
+- **句末标点连同其后空白一并归入前一段**：连续句末标点（如"？！"）完整保留在前段末尾；
+- **末段延伸至全文末尾**：尾部句末标点天然含在末段内，不再需要独立的"尾部追加"逻辑；
+- **兜底块文本不进入正常段**：兜底块的字符区间边界强制切分（条件 3），其文本与标点只出现在兜底段自身，不会被前一段吞掉造成重复；
+- **拼接无损由构造保证**：相邻区间的字符首尾相接且整体覆盖全文，故按 `start` 排序后
+  `"".join(segments[].text) == text` **恒成立**，不再依赖词文本匹配成功与否。
+  唯一的例外是"对齐 item 文本完全不在全文中"的退化场景（此时段文本退化为 item 文本拼接）。
 
 **回退与降级**：
 
 - 句中静音间隙/说话人变化导致的拆段 → 默认 punctuation 模式已消除；若仍出现，检查启动命令是否显式配置了 `--segment-split-mode hybrid`（误配置回退了行为）；
-- 英文/缩写密集内容（匹配失败回退见下）→ 显式 `--segment-split-mode hybrid`；
 - 线上标点误切（如英文缩写句点，见 §12）→ `--punctuation-split off` 即时关闭标点切分（纯间隙切分，阈值仍 2.0s，无需降级版本）；
 - 完整 pre-punct 旧行为 → `--punctuation-split off --segment-gap-threshold 0.8`（此组合下 word 模式同人聚合恢复旧活性）；
-- 对齐词文本在全文中匹配失败（罕见，英文/缩写密集内容更易触发）→ 整体回退：punctuation 模式**仅剩段长兜底**（约 30s 均匀粗块）、hybrid 模式回退纯间隙（2.0s），不追加标点，不抛异常。
+- ~~对齐词文本匹配失败 → 整体回退为 30s 均匀粗块~~ —— **本版已取消该回退**：切点由文本扫描独立决定，单 token 失配不再影响标点切分；`--segment-split-mode hybrid` 也无需再为"缩写密集内容"显式配置。
 
 ### 8.4 错误响应
 
@@ -711,7 +897,7 @@ OpenAI 风格 `{"error": {"message": ..., "type": "invalid_request_error", ...}}
 | 启动（已创建） | `docker start qwen3-asr` |
 | 重启 | `docker restart qwen3-asr` |
 | 删除容器 | `docker rm -f qwen3-asr` |
-| 更新代码（新镜像） | **轻量构建（推荐）**：把 `docker/Dockerfile-qwen3-asr-punct2` 与整个 `qwen_asr/` 目录（~600KB）传到目标机 `/data/patch/` → `cd /data/patch && docker build -t qwen3-asr-offline:cu128-punct2 .`（基于目标机已有基础镜像，秒级完成）→ `docker rm -f` 旧容器 → 重新 `docker run`（模型目录不动）；**传统 tar 分发**：构建机重 build → `docker save \| gzip > xxx.tar.gz` → 目标机 `docker load` → 重建容器 |
+| 更新代码（新镜像） | **轻量构建（推荐）**：把 `docker/Dockerfile-qwen3-asr-align-fallback` 与整个 `qwen_asr/` 目录（~600KB）传到目标机 `/data/patch/` → `cd /data/patch && docker build -t qwen3-asr-offline:cu128-align-fallback .`（基于目标机已有 `qwen3-asr-offline:cu128-punct`，秒级完成；只有 punct2 时先 `docker tag ...punct2 ...punct`，见 §2.4 末）→ `docker rm -f` 旧容器 → 重新 `docker run`（模型目录不动）；**传统 tar 分发**：构建机重 build → `docker save \| gzip > xxx.tar.gz` → 目标机 `docker load` → 重建容器 |
 | 更新模型 | 替换 `/data/models` 下对应目录 → `docker restart qwen3-asr`（镜像不动） |
 | 回滚 | 保留旧 tar 包 → `docker load` 旧镜像 → 重建容器 |
 
@@ -756,7 +942,7 @@ proxy_send_timeout 900s;
 
 - **现象**：第一个 segment 请求 200 OK 正常返回；第二个请求起永久挂起，traceback 停在 `scheduler.py ... await ticket.future`；`/health/detail` 显示 `freeVramMb` 从 ~3.9GB 掉到 ~2.4GB 不回升，`queuedTasks` 持续 ≥ 1；
 - **原因**：对齐/说话人前向结束后，PyTorch 缓存分配器把空闲显存块留在自己手里不归还驱动 → 调度器用 `mem_get_info` 实测空闲显存做准入判断，误判"显存不足"（阈值 ≈ 2.9GB > 2.4GB）→ 后续任务全部滞留队列。**假死锁**：缓存块实际可复用，并非真占满；
-- **解法**：使用 `cu128-punct2`（或 hotfix/punct）镜像（fix3：任务收尾、调度许可释放前 `torch.cuda.empty_cache()` 归还空闲块）；
+- **解法**：使用 `cu128-align-fallback`（或 punct2/hotfix/punct）镜像（fix3：任务收尾、调度许可释放前 `torch.cuda.empty_cache()` 归还空闲块）；
 - **应急绕过**（旧镜像不改代码）：启动加 `--gpu-reserve-mb 256` 降低准入阈值——但余量被压缩后大任务有 OOM 风险，仅限临时；
 - **验证**：任务完成后 `/health/detail` 的 `freeVramMb` 应回升 ~3.8GB。
 
@@ -795,9 +981,13 @@ proxy_send_timeout 900s;
 - **`--max-num-batched-tokens` 下限约束**：必须 ≥ 8192（覆盖 180s 分块的 ~4500 token 单次 prefill），低于该值长音频会触发 §11 #2 的停滞；若未来调大音频分块时长，需同步上调此参数。
 - **同步长响应**：1h 音频高并发时队尾任务等待较久，中间代理超时会切断连接（服务端有断连取消，不白算但客户端拿不到结果）。
 - **`speaker=null` 语义**：无法判定主导说话人的段，其时长不计入任何 speaker 的 totalDuration。
-- **word 归属模式精度上限**：换人点附近个别词可能错归属（受 diarization 边界 ±0.5s 误差限制，见 §8.3.1）；对齐失败块的粗段兜底为 180s 块级粒度，粗段时长整段计入 dominant speaker（见 §8.3.2）。
-- **英文缩写句点误切**（标点切分，§8.3.3）：`Mr. Smith` 类缩写句点被视为句末标点触发误切；词内含句点的 token（`U.S.A.`/`3.14`）经对齐清洗为 `USA`/`314` 后全文匹配失败，走整体回退（见下条）不受影响；线上出现误切可 `--punctuation-split off` 即时关闭。
+- **word 归属模式精度上限**：换人点附近个别词可能错归属（受 diarization 边界 ±0.5s 误差限制，见 §8.3.1）；兜底段（§8.3.2）时长整段计入 dominant speaker，本版按标点切分后失真幅度已下降。
+- **兜底段时间戳为估算值**（§8.3.2）：兜底块内各段的 `start`/`end` 是按字符偏移在块区间上**线性分摊**的估算值，不是对齐实测值。仅供分段参考，不适合做逐字级定位。
+- **兜底块内无标点时仍为整块一段**（§8.3.2）：兜底块内部完全没有句末标点时，仍产出与块等长的单段（最长 180s）。**这是刻意保留的**——再按段长切碎只会把线性估算伪装成精确时间戳，反而误导下游。若确有业务影响，正确方向是让对齐器对兜底块也产出时间戳，而非在切分层切分估算。
+- **段文本可能以空白结尾**（§8.3.3）：句末标点之后的空白归入前一段，故段文本可能出现尾部空格（如 `"Hello, world. "`）。这是保证 `"".join(segments[].text) == text` 的必要条件——此前该空白被丢弃，反而导致拼接有损。
+- **英文缩写句点误切**（标点切分，§8.3.3）：`Mr. Smith` 类缩写句点被视为句末标点触发误切。线上出现误切可 `--punctuation-split off` 即时关闭。
+  - 已改善项：词内含句点的 token（`U.S.A.`/`3.14`/`0.35`）经对齐清洗为 `USA`/`314`/`035` 后，此前会因全文匹配失败导致**整份音频标点切分失效**；本版改为局部回退，只损失该 token 自身的时间锚点，其余标点切分不受影响。
 - **短插话保护区间收窄**（hybrid 切分模式，§8.3.3）：无标点处 0.8~2.0s 间隙不再切分，原"未转写短插话保护"（间隙内他人 turn ≥ 0.3s 阻止合并）在该区间不再触发——间隙里的未转写插话不再以"段间隙"形式保留；保护仍在实际发生的切分（间隙 ≥ 2.0s、标点边界、说话人变化）后的合并判定中生效。punctuation 切分模式下间隙切分整体关闭，保护仅存在于切分后合并判定（不跨标点/失败块边界）。
 - **无标点文本段变长**（标点切分，§8.3.3）：ASR 不输出标点时，hybrid 模式全部边界按 2.0s（原 0.8s）切分、punctuation 模式按段长兜底切分，段更长，均受 `--max-segment-seconds` 30s 上限约束。
-- **标点匹配失败回退**（标点切分，§8.3.3）：对齐词文本在全文中匹配失败（英文/缩写密集内容更易触发）时整体回退——punctuation 模式仅剩段长兜底（约 30s 均匀粗块，段级标点信息全失）、hybrid 模式回退纯间隙行为（2.0s），不追加标点；英文/缩写密集内容建议显式 `--segment-split-mode hybrid`。
+- **item 文本完全失配时的退化**：若某段的对齐 item 文本在全文里一个都匹配不上（极罕见），该段文本退化为 item 文本拼接，此时**拼接不再无损**。可结合 §7.4 校验 3 的兜底日志定位。
 - **word 粒度未支持**：`timestamp_granularities[]=word` 返回 400。

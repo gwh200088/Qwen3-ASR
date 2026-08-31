@@ -5,6 +5,14 @@
 >
 > **模型来源**：`D:\workplace\TMRI\AI\body_Camera\model\models`（已存在，无需任何下载）。
 
+> ⚠️ **本文档定位**：记录**首次从零构建基础镜像**（`qwen3-asr-offline:cu128`）的完整流程与踩坑实证，
+> 适用于需要重建基座或排查基础镜像问题的场景。
+>
+> **日常部署与升级请优先看 `docs/deployment-guide.md`** —— 当前生产镜像为
+> `qwen3-asr-offline:cu128-align-fallback`（在 `cu128-punct` 之上全量覆盖 `qwen_asr/`，
+> 采用"只传源码、目标机轻量构建"的叠加方式，见该文档 §2.5 与 §9）。
+> 基础镜像已存在时**不需要**重跑本文档的 §3.1~§3.3。
+
 ---
 
 ## 0. 本地模型盘点与实测结论（本会话容器内验证）
@@ -243,12 +251,17 @@ docker build -f docker/Dockerfile-qwen3-asr-hotfix -t qwen3-asr-offline:cu128-ho
 
 ```bash
 docker save qwen3-asr-offline:cu128-hotfix | gzip > qwen3-asr-offline-cu128-hotfix.tar.gz
+
+# 当前生产镜像为叠加层，打包方式相同（见 deployment-guide.md §2.5）：
+# docker save qwen3-asr-offline:cu128-align-fallback \
+#   | gzip > qwen3-asr-offline-cu128-align-fallback.tar.gz
 ```
 
-最终交付物：`qwen3-asr-offline-cu128-hotfix.tar.gz`（~15 GB）+ `qwen3-asr-models.tar.gz`（~6.3 GB），合计 ~21 GB。
+最终交付物：镜像 tar（~15 GB）+ `qwen3-asr-models.tar.gz`（~6.3 GB），合计 ~21 GB。
 
 > 目标机部署、启动参数（含必加的 `--max-num-batched-tokens 8192`）与故障排查
 > 见 `docs/deployment-guide.md`（部署操作手册）。
+> 说话人识别调优见 `docs/diarization-tuning-guide.md`。
 
 ## 4. 阶段二：传输
 

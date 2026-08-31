@@ -19,26 +19,32 @@ Segment 转写管道纯逻辑（零 GPU 依赖，仅标准库）。
 职责（对应 spec「Segment 切分与说话人归属」与「词级说话人归属」）：
 
 - 语言名 ↔ BCP-47 风格码双向映射（30 项，逐项照抄 spec 表格）；
-- 对齐 token 序列 → 句级 segment 切分（切分维度模式 spec「segment 切分
-  维度模式」：``punctuation``（默认）只按句末标点硬边界 + 段长上限切分，
-  静音间隙与句中说话人变化均不切分；``hybrid`` 为标点 + 间隙 + 说话人
-  变化的上一代混合行为；跨失败块边界恒切分——遗留 ❶ 修复）；
-- 段文本游标匹配：从完整 ASR 文本截取（保留标点与空格），失败回退拼接；
-  句末标点硬边界处切分时，between-span 中的句末标点附前段 ``text`` 末尾
-  （含末段尾部追加），客户端拼接 ``segments[].text`` 与 ``text`` 标点无损；
+- segment 切分采用**文本优先的三层解耦架构**（切点与对齐输出无关）：
+  - Layer 1（纯文本，零 aligner 依赖）：直接扫描 ``full_text`` 按句末标点
+    划分，粗粒度兜底块的字符区间边界强制切分。产出首尾相接、完整覆盖全文
+    的字符区间；
+  - Layer 2（时间映射）：把 align item 映射回字符区间（**局部回退**——单个
+    token 失配只影响它自身，不再全量回退），区间时间取覆盖它的 items 的
+    min/max；
+  - Layer 3（item 维度细分）：文本段之内的段长强切，以及 ``hybrid`` 模式的
+    间隙/说话人变化切分与同人二次聚合。``punctuation``（默认）跳过后者；
+- 段文本 = ``full_text[c_start:c_end]`` **划分**（非截取）：相邻区间首尾相接，
+  ``"".join(segments[].text) == text`` 由构造保证，无需标点追加/补偿逻辑；
 - 说话人归属双模式：
   - ``segment``（段级投票，原有行为零改动）：segment 与 diarization 片段的
     时间重叠计算（dominant + speakers 列表）；
   - ``word``（词级归属，默认）：以 align_items 为词序列，词时间中点投票
     归属说话人，洞（无 turn 覆盖词）插值填充，按说话人变化切分 +
     同人二次聚合（含短插话保护）；
-- 对齐失败块的粗粒度兜底段（coarse_chunks，两种归属模式均生效）；
+- 对齐失败块的粗粒度兜底段（coarse_chunks，两种归属模式均生效）：块字符
+  区间内的标点同样触发切分，各子区间时间按字符偏移在块区间上线性分摊；
 - speakerSummary 汇总（覆盖全部识别说话人，含零值项）。
 
 本模块供 middleware 调用，也可被 example ``--self-test`` 离线自测，
 不 import torch / pyannote / vLLM 等任何重依赖。
 """
 
+import bisect
 import dataclasses
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -465,35 +471,143 @@ def _split_groups(
     return groups
 
 
-def _extract_segment_text(
-    items: List[Tuple[str, float, float]],
-    full_text: str,
-    cursor: int,
-) -> Tuple[str, int]:
-    """游标匹配从 ``full_text`` 截取段文本，返回 ``(段文本, 新游标)``。
+@dataclasses.dataclass
+class _TextSpan:
+    """Layer 1 产物：文本层切分单元（首尾相接，完整覆盖 ``full_text``）。
 
-    - 维护游标（单调不回退）：对段内每个 item 的文本从上次匹配末位置起
-      ``find``；全部命中则段文本 = ``full_text[首匹配起点:末匹配终点]``，
-      保留期间的标点与空格；
-    - 任一 item 找不到 → 回退拼接：item 文本全 ASCII 用 ``" ".join``，
-      否则 ``"".join``（中文等无空格语言）；此时游标保持不变。
+    Attributes:
+        c_start: 字符区间起点（含）。
+        c_end: 字符区间终点（不含）；恒有 ``c_end > c_start``。
+        coarse_index: 落在粗粒度兜底块字符区间内时为对应 ``coarse_chunks``
+            下标，否则为 ``None``。
     """
-    pos = cursor
-    first = -1
-    last_end = -1
-    for text, _, _ in items:
-        idx = full_text.find(text, pos)
-        if idx < 0:
-            break
-        if first < 0:
-            first = idx
-        last_end = idx + len(text)
-        pos = last_end
-    else:
-        return full_text[first:last_end], last_end
-    texts = [text for text, _, _ in items]
-    joined = " ".join(texts) if all(t.isascii() for t in texts) else "".join(texts)
-    return joined, cursor
+
+    c_start: int
+    c_end: int
+    coarse_index: Optional[int] = None
+
+    @property
+    def is_coarse(self) -> bool:
+        return self.coarse_index is not None
+
+
+def _resolve_coarse_char_spans(
+    coarse: List[Tuple[str, float, float]],
+    coarse_char_spans: Optional[List[Tuple[int, int]]],
+    full_text: str,
+) -> List[Tuple[int, int]]:
+    """确定每个粗段在 ``full_text`` 中的字符区间（与 ``coarse`` 等长对齐）。
+
+    优先用 middleware 基于 ``per_chunk`` 文本长度算出的精确区间。下标缺失、
+    长度不匹配、越界或区间无效时**逐下标**退回游标 ``find`` 兜底（按 ``start``
+    排序避免乱序错位）——必须兜底的原因：未能定位的粗段无法在 Layer 1 的字符
+    域被切出去，其文本会被相邻正常段的字符区间一并卷入，与粗段自身 ``text``
+    重复（拼接有损）。
+
+    真的定位不到的下标以 ``(-1, -1)`` 占位，由调用方按"未定位"处理（该粗段
+    退化为整块段，沿用既有行为）。
+
+    Returns:
+        与 ``coarse`` 一一对应的 ``(char_start, char_end)`` 列表。
+    """
+    limit = len(full_text)
+    resolved: List[Optional[Tuple[int, int]]] = []
+    for i in range(len(coarse)):
+        pair = (
+            coarse_char_spans[i]
+            if coarse_char_spans is not None and i < len(coarse_char_spans)
+            else None
+        )
+        if pair is not None:
+            s, e = int(pair[0]), int(pair[1])
+            if 0 <= s < e <= limit:
+                resolved.append((s, e))
+                continue
+        resolved.append(None)
+    # 未提供 / 无效的下标按时间顺序 find 兜底
+    pending = [i for i, r in enumerate(resolved) if r is None]
+    if pending:
+        pos = 0
+        for i in sorted(pending, key=lambda k: coarse[k][1]):
+            coarse_text = coarse[i][0]
+            if not coarse_text:
+                continue
+            idx = full_text.find(coarse_text, pos)
+            if idx >= 0:
+                resolved[i] = (idx, idx + len(coarse_text))
+                pos = idx + len(coarse_text)
+    return [(r if r is not None else (-1, -1)) for r in resolved]
+
+
+def _split_text_spans(
+    full_text: str,
+    coarse_char_spans: Optional[List[Tuple[int, int]]] = None,
+    split_on_punctuation: bool = True,
+) -> List[_TextSpan]:
+    """Layer 1：按句末标点划分 ``full_text``（纯文本，零 aligner 依赖）。
+
+    切点（位置 ``p`` 表示 ``full_text[:p]`` 结束一个文本段）来自两类：
+
+    - **句末标点连续串 + 其后空白**之后：``。`` / ``？！`` 等整串连同后续空白
+      归入前一段，切点落在空白之后——等价既有「句末标点附前段」语义，故
+      ``puncts`` 列表与「末段尾部标点追加」逻辑整体退场；
+    - **粗粒度兜底块字符区间的起点与终点**：正常段不得横跨兜底块文本，替代
+      既有 ``_gap_blocked`` 的**时间域**判定，改由字符域精确切割。
+
+    段文本即 ``full_text[c_start:c_end]`` 原样切片。既有实现是**截取**
+    （``full_text[首匹配起点:末匹配终点]``），between-span 中的字符必然丢失
+    或错位（遗留 ❸ 的根因）；此处改为**划分**——相邻区间首尾相接且整体覆盖
+    ``[0, len(full_text))``，``"".join(seg["text"]) == full_text`` 由构造保证。
+
+    Args:
+        full_text: 完整 ASR 文本。
+        coarse_char_spans: 各粗段的 ``(char_start, char_end)``，与
+            ``coarse_chunks`` 一一对应；``(-1, -1)`` 表示未定位，忽略。
+        split_on_punctuation: False 时只按粗段边界切分（对应
+            ``punctuation_split=False`` 的纯间隙行为）。
+
+    Returns:
+        首尾相接的 ``_TextSpan`` 列表；``full_text`` 为空时返回空列表。
+    """
+    n = len(full_text)
+    if n == 0:
+        return []
+    coarse_ranges = [
+        (int(cs), int(ce), idx)
+        for idx, (cs, ce) in enumerate(coarse_char_spans or [])
+        if cs is not None and ce is not None and 0 <= cs < ce
+    ]
+    cuts: set = set()
+    for cs, ce, _idx in coarse_ranges:
+        if 0 < cs < n:
+            cuts.add(cs)
+        if 0 < ce < n:
+            cuts.add(ce)
+    if split_on_punctuation:
+        i = 0
+        while i < n:
+            if full_text[i] in _SENTENCE_END_CHARS:
+                j = i
+                while j < n and full_text[j] in _SENTENCE_END_CHARS:
+                    j += 1
+                while j < n and full_text[j].isspace():
+                    j += 1
+                if j < n:
+                    cuts.add(j)
+                i = j
+            else:
+                i += 1
+    spans: List[_TextSpan] = []
+    prev = 0
+    for p in sorted(cuts) + [n]:
+        if p <= prev or p > n:
+            continue
+        cidx = next(
+            (idx for cs, ce, idx in coarse_ranges if cs <= prev < ce), None
+        )
+        spans.append(_TextSpan(prev, p, cidx))
+        prev = p
+    return spans
 
 
 #: 句末标点集合（spec「句末标点硬切分」）：``。！？；`` + ASCII ``.!?;``
@@ -502,70 +616,203 @@ def _extract_segment_text(
 _SENTENCE_END_CHARS = set("。！？；.!?;\n")
 
 
-def _sentence_end_boundaries(
+def _map_items_to_chars(
     items: List[Tuple[str, float, float]],
     full_text: str,
-    coarse_spans: Optional[List[Tuple[float, float]]] = None,
-) -> Tuple[List[bool], List[str], bool, int]:
-    """计算相邻 item 之间的句末标点硬边界与边界标点序列。
+) -> List[Optional[Tuple[int, int]]]:
+    """Layer 2：把每个对齐 item 映射到 ``full_text`` 的字符区间。
 
-    与 ``_extract_segment_text`` 同一 greedy ``find`` 游标语义把每个 item
-    匹配到 ``full_text``；相邻 item 匹配区间之间的 between-span
-    （``full_text[前item匹配终点:后item匹配起点]``）：
+    沿用既有 greedy ``find`` 游标语义，但失败语义从**全量回退**改为
+    **局部回退**：
 
-    - 含任一句末标点 → ``boundaries[i] = True``（硬边界，无视间隙恒切分），
-      ``puncts[i]`` 为 between-span 中全部句末标点字符按出现顺序拼接
-      （如 ``"。"``, ``"？！"``；空格 / 引号等非句末标点字符不收集）；
-    - 不含 → ``boundaries[i] = False``，``puncts[i] = ""``；
-    - 跨失败块边界恒切分（遗留 ❶ 修复）：边界时间间隙区间与任一 coarse
-      块区间相交 → ``boundaries[i] = True`` **强制切分**且 ``puncts[i] = ""``
-      ——正常段不得横跨失败块，否则 ``_extract_segment_text`` 游标截取
-      ``full_text[首:末]`` 会把 between-span 中的失败块文本截入段文本，
-      与粗段 ``text`` 重复且拼接有损（该问题在 punctuation 模式下触发面
-      为"无标点"即触发——间隙维度关闭，故必须恒切分兜底）。
+    - 命中 → 记录 ``(起点, 终点)`` 并推进游标；
+    - 未命中 → 记 ``None`` 且**游标不推进**（后续 item 仍按原游标继续匹配）。
 
-    规则：
+    既有实现在任一 item 未命中时立即返回全 ``False`` 边界，使整份音频的
+    标点切分失效（实测：196s 音频因单个 token 未命中，75 个句末标点全部
+    失效，只切出 7 段）。局部回退把影响面收敛到该 token 自身——其余 item
+    的字符位置信息完整保留，切分由 Layer 1 的文本扫描独立决定，不受牵连。
 
-    - 跨失败块边界 puncts 置空（v3）：边界时间间隙区间 ``[items[i].end,
-      items[i+1].start]`` 与任一 coarse 块区间相交（``_gap_blocked`` 同一
-      时间域判定）→ ``puncts[i] = ""``——该 between-span 含整块失败文本
-      （最长 180s），标点拼入会给前段追加垃圾后缀并与粗段原文标点重复；
-      v4 起该边界同时**强制切分**（见上"恒切分"），两者组合保证失败块
-      文本仅计入粗段一次；
-    - 任一 item 匹配失败 → 全量回退（全 ``False`` + 全空串）：失败 item
-      后游标位置不确定，部分保留已匹配前缀的边界可能使后续 between-span
-      错位（标点误判），全量回退语义保守且可预测，不抛异常。
-
-    Returns:
-        ``(boundaries, puncts, matched, last_end)``：两个列表长度均为
-        ``len(items) - 1``（``len(items) <= 1`` 时为空）；``matched`` 为全局
-        匹配成功标志；``last_end`` 为末词匹配终点（匹配失败或空序列时为
-        -1），供末段尾部句末标点追加。
+    aligner 的 token 经 ``clean_token`` 剥离标点与空白后与 ASR 原文可能不再
+    逐字相等（``0.35``→``035``、``2024-01-01``→``20240101``、
+    ``三零二X。GTDCH``→``XGTDCH``），此类 token 必然未命中；局部回退使其
+    代价从"整段失效"降为"少一个时间锚点"。
     """
-    total = len(items)
+    spans: List[Optional[Tuple[int, int]]] = []
     pos = 0
-    spans: List[Tuple[int, int]] = []  # 各 item 的 (匹配起点, 匹配终点)
     for text, _, _ in items:
         idx = full_text.find(text, pos)
         if idx < 0:
-            return [False] * (total - 1), [""] * (total - 1), False, -1
+            spans.append(None)
+            continue
         spans.append((idx, idx + len(text)))
         pos = idx + len(text)
-    boundaries: List[bool] = []
-    puncts: List[str] = []
-    for i in range(total - 1):
-        between = full_text[spans[i][1]:spans[i + 1][0]]
-        collected = "".join(ch for ch in between if ch in _SENTENCE_END_CHARS)
-        if _gap_blocked(items[i][2], items[i + 1][1], coarse_spans):
-            # 跨失败块边界恒切分（遗留 ❶ 修复）：段不横跨失败块，避免游标
-            # 截取把失败块文本截入段文本（与粗段重复）；puncts 置空（v3），
-            # 失败块标点仅保留在粗段原文中
-            boundaries.append(True)
-            puncts.append("")
-        else:
-            boundaries.append(bool(collected))
-            puncts.append(collected)
-    return boundaries, puncts, True, spans[-1][1] if spans else -1
+    return spans
+
+
+def _assign_item_buckets(
+    text_spans: List[_TextSpan],
+    item_chars: List[Optional[Tuple[int, int]]],
+) -> List[int]:
+    """Layer 2：判定每个 item 归属哪个文本段（按字符起点二分）。
+
+    未命中（``None``）的 item 无法定位，继承前一个 item 的归属以保序；
+    首个 item 即未命中时归 0。这保证 aligner 整体失配时全部 item 仍落在
+    同一文本段，退化行为与既有「纯间隙/段长切分」一致。
+    """
+    if not text_spans:
+        return []
+    starts = [span.c_start for span in text_spans]
+    last = len(text_spans) - 1
+    buckets: List[int] = []
+    prev = 0
+    for chars in item_chars:
+        if chars is None:
+            buckets.append(prev)
+            continue
+        idx = bisect.bisect_right(starts, chars[0]) - 1
+        if idx < 0:
+            idx = 0
+        elif idx > last:
+            idx = last
+        buckets.append(idx)
+        prev = idx
+    return buckets
+
+
+def _absorb_orphan_buckets(
+    text_spans: List[_TextSpan],
+    bucket_items: List[List[int]],
+) -> Tuple[List[_TextSpan], List[List[int]]]:
+    """把无 item 覆盖的文本段（孤儿文本）并入相邻段。
+
+    孤儿文本没有时间锚点，单独成段会产出零时长段，并入相邻段更合理：
+    优先并入**前一个非粗段**（文本接续语义更自然），前一段不存在或是粗段时
+    并入**后一个非粗段**。两向搜索**均不得跨越粗段**——否则正常段的字符区间
+    会把粗段原文一并卷入，与粗段自身 ``text`` 重复。粗段自身有块区间时间，
+    既不并入也不被并入。
+    """
+    n = len(text_spans)
+    if n == 0:
+        return [], []
+    has_items = [bool(idxs) for idxs in bucket_items]
+    target = list(range(n))
+
+    def _search(i: int, step: int) -> int:
+        """沿 step 方向找最近的可并入目标；遇粗段即止，找不到返回 -1。"""
+        j = i + step
+        while 0 <= j < n:
+            if text_spans[j].is_coarse:
+                return -1
+            if has_items[j]:
+                return j
+            j += step
+        return -1
+
+    for i in range(n):
+        if has_items[i] or text_spans[i].is_coarse:
+            continue
+        j = _search(i, -1)
+        if j < 0:
+            j = _search(i, 1)
+        if j >= 0:
+            target[i] = j
+
+    out_spans: List[_TextSpan] = []
+    out_items: List[List[int]] = []
+    new_index: Dict[int, int] = {}
+    for i in range(n):
+        if target[i] == i:
+            new_index[i] = len(out_spans)
+            out_spans.append(text_spans[i])
+            out_items.append(list(bucket_items[i]))
+    for i in range(n):
+        if target[i] == i:
+            continue
+        k = new_index.get(target[i])
+        if k is None:
+            continue
+        prev = out_spans[k]
+        out_spans[k] = _TextSpan(
+            min(prev.c_start, text_spans[i].c_start),
+            max(prev.c_end, text_spans[i].c_end),
+            prev.coarse_index,
+        )
+    return out_spans, out_items
+
+
+def _coarse_span_time(
+    span: _TextSpan,
+    coarse: List[Tuple[str, float, float]],
+    coarse_char_spans: List[Tuple[int, int]],
+) -> Tuple[float, float]:
+    """粗段内子区间的起止时间：按字符偏移在块区间上线性分摊。
+
+    Layer 1 会在粗段内部按标点继续切分（既有实现把整块 180s 文本作为单段
+    产出，段内标点完全不切分），故此处为各子区间估出时间。块区间
+    ``[t_start, t_end]`` 由 middleware 给出，分摊比例取子区间在块字符区间
+    中的相对位置。
+    """
+    idx = span.coarse_index
+    if idx is None or idx >= len(coarse) or idx >= len(coarse_char_spans):
+        return 0.0, 0.0
+    _text, t_start, t_end = coarse[idx]
+    cs, ce = coarse_char_spans[idx]
+    total = ce - cs
+    if total <= 0:
+        return float(t_start), float(t_end)
+    frac_s = min(1.0, max(0.0, (span.c_start - cs) / float(total)))
+    frac_e = min(1.0, max(0.0, (span.c_end - cs) / float(total)))
+    return (
+        t_start + (t_end - t_start) * frac_s,
+        t_start + (t_end - t_start) * frac_e,
+    )
+
+
+def _subgroup_char_bounds(
+    span: _TextSpan,
+    groups: List[List[Any]],
+    group_item_chars: List[List[Optional[Tuple[int, int]]]],
+) -> Optional[List[Tuple[int, int]]]:
+    """把文本段字符区间按子组划界；任一子组无已映射 item 时返回 ``None``。
+
+    子组来自 Layer 3 的段长强切 / 间隙 / 说话人变化切分。划界规则：首子组
+    起点为段起点、末子组终点为段终点、中间边界取后一子组首个已映射 item 的
+    字符起点——保证各子组区间首尾相接、合起来恰好覆盖整个文本段。
+    """
+    if not groups:
+        return []
+    starts: List[int] = []
+    for chars in group_item_chars:
+        first = next((c[0] for c in chars if c is not None), None)
+        if first is None:
+            return None
+        starts.append(first)
+    bounds: List[Tuple[int, int]] = []
+    cursor = span.c_start
+    for k in range(1, len(starts)):
+        cut = min(max(starts[k], cursor), span.c_end)
+        bounds.append((cursor, cut))
+        cursor = cut
+    bounds.append((cursor, span.c_end))
+    return bounds
+
+
+def _group_text(
+    group: List[Any],
+    bounds: Optional[Tuple[int, int]],
+    full_text: str,
+) -> str:
+    """子组文本：优先取字符区间切片，无法定位时回退拼接 item 文本。
+
+    回退路径与既有实现一致：item 文本全 ASCII 用 ``" ".join``，否则
+    ``"".join``（中文等无空格语言）。
+    """
+    if bounds is not None:
+        return full_text[bounds[0]:bounds[1]]
+    texts = [pair[0] for pair in group]
+    joined = " ".join(texts) if all(t.isascii() for t in texts) else "".join(texts)
+    return joined
 
 
 def build_segment_response(
@@ -589,7 +836,7 @@ def build_segment_response(
     :param align_items: 对齐 item 列表（鸭子类型 ``.text`` / ``.start_time`` /
         ``.end_time``），可为空；
     :param diarization: diarization 片段（对象 / 三元组 / dict，见 ``_to_turns``）；
-    :param full_text: 完整 ASR 文本（段文本从中游标截取）；
+    :param full_text: 完整 ASR 文本（段文本从中直接切片，**划分**而非截取）；
     :param language_name: 内部语言名（经 ``language_name_to_code`` 输出码）；
     :param duration: 音频时长（秒）；
     :param process_time: 服务端总耗时（秒），``None`` 则响应中为 ``null``；
@@ -612,20 +859,20 @@ def build_segment_response(
         ``<= 0`` 表示不合并）。**仅 ``hybrid`` 模式生效**（punctuation
         模式下同人二次聚合整体跳过，为无操作参数）；
     :param coarse_chunks: 对齐失败块的粗粒度兜底 ``(text, start, end)`` 列表
-        （两种归属模式均生效）：每块产出一个块级粗段（块区间投票 + 块 ASR
-        原文），与正常段混合产出时 ``segments[]`` 按 ``start`` 全局升序，
-        粗段不参与同人二次聚合；
-    :param punctuation_split: 句末标点硬切分开关（默认 True）：True 时相邻
-        item 在 ``full_text`` 中匹配区间之间存在句末标点（``。！？；.!?;``
-        及换行）的边界恒切分（无视间隙）、切分处句末标点附前段 ``text``
-        末尾、末段追加全文尾部句末标点；False 时跳过硬边界计算，纯间隙/
-        段长（word 模式含说话人变化）切分（``segment_split_mode`` 被忽略，
-        由 serve 启动校验输出组合告警），段文本截取行为不变。
+        （两种归属模式均生效）：块字符区间内的标点同样触发切分，各子区间
+        时间按字符偏移在块区间上线性分摊（既有实现把整块作为单段产出，段内
+        标点完全不切分）；与正常段混合产出时 ``segments[]`` 按 ``start``
+        全局升序，粗段不参与同人二次聚合；
+    :param punctuation_split: 句末标点硬切分开关（默认 True）：True 时按
+        ``。！？；.!?;`` 及换行**直接扫描全文**划分文本段（切点与对齐输出
+        无关，标点连同其后空白归入前段）；False 时只按粗段字符区间切分，
+        退化为纯间隙/段长（word 模式含说话人变化）行为，``segment_split_mode``
+        被忽略（由 serve 启动校验输出组合告警）。
     :param coarse_char_spans: 每个粗段在 ``full_text`` 中的精确字符区间
         ``[(char_start, char_end), ...]``，与 ``coarse_chunks`` 一一对应。
-        None 时 pipeline 用 ``coarse_text`` 在 ``full_text`` 中游标 ``find``
-        计算（双保险兜底）。用途：末段尾部标点追加逻辑排除粗段字符区间，
-        避免尾部空 items 块的标点被重复追加到正常段（P0 修复）。
+        **已由优化项升级为主路径依赖**——Layer 1 据此在字符域精确切割粗段
+        边界（替代既有 ``_gap_blocked`` 的时间域判定）。None 时 pipeline 用
+        ``coarse_text`` 在 ``full_text`` 中游标 ``find`` 兜底。
     """
     turns = _to_turns(diarization)
     items = [
@@ -637,163 +884,180 @@ def build_segment_response(
         for text, start, end in (coarse_chunks or [])
     ]
 
-    # 句末标点硬边界（spec「标点感知 Segment 切分」）：False 时跳过计算
-    # （boundaries=None，纯间隙行为，segment_split_mode 被忽略）；匹配失败
-    # 全量回退（全 False，无追加）；跨失败块边界恒 True（遗留 ❶ 修复）
-    if punctuation_split:
-        hard_boundaries, puncts, matched, last_end = _sentence_end_boundaries(
-            items, full_text, coarse_spans=[(start, end) for _, start, end in coarse]
-        )
-    else:
-        hard_boundaries, puncts, matched, last_end = None, [], False, -1
+    # ---- Layer 1：纯文本切分（切点与对齐输出彻底解耦）----------------------
+    # 切点 = 句末标点连续串（含其后空白）之后 + 粗段字符区间边界。段文本为
+    # full_text 的直接切片，相邻区间首尾相接且整体覆盖全文，
+    # "".join(seg["text"]) == full_text 由构造保证——既有「puncts 附前段 /
+    # 末段尾部追加 / tail 排除粗段字符区间」三套补偿逻辑（含遗留 ❷）整体退场。
+    coarse_spans = _resolve_coarse_char_spans(coarse, coarse_char_spans, full_text)
+    text_spans = _split_text_spans(
+        full_text, coarse_spans, split_on_punctuation=bool(punctuation_split)
+    )
+    if not text_spans and items:
+        # full_text 为空却存在对齐 item（理论上不应发生——item 由文本对齐而来）：
+        # 无文本可划分，退化为单一空文本段，段文本走回退拼接路径，避免整份
+        # 响应丢段（既有实现在此场景亦产出回退拼接段）
+        text_spans = [_TextSpan(0, 0)]
+
+    # ---- Layer 2：item → 字符区间映射（局部回退）+ 文本段归属 --------------
+    item_chars = _map_items_to_chars(items, full_text)
+    item_bucket = _assign_item_buckets(text_spans, item_chars)
+    bucket_items: List[List[int]] = [[] for _ in text_spans]
+    for i, bucket in enumerate(item_bucket):
+        if 0 <= bucket < len(bucket_items):
+            bucket_items[bucket].append(i)
+    text_spans, bucket_items = _absorb_orphan_buckets(text_spans, bucket_items)
+
+    # 已在文本中定位的粗段（字符域已切分）；未定位者（字符区间反查失败 /
+    # find 兜底失败）退化为**时间域**强制切分——正常段不得在时间上横跨失败块，
+    # 沿用既有「跨失败块恒切分」语义（遗留 ❶）的兜底路径。
+    located_coarse: set = {
+        span.coarse_index for span in text_spans if span.is_coarse
+    }
+    unlocated_time: List[Tuple[float, float]] = [
+        (start, end)
+        for i, (_text, start, end) in enumerate(coarse)
+        if i not in located_coarse
+    ]
+    time_forced: List[bool] = [False] * max(0, len(items) - 1)
+    if unlocated_time:
+        for i in range(len(items) - 1):
+            if _gap_blocked(items[i][2], items[i + 1][1], unlocated_time):
+                time_forced[i] = True
 
     # 切分维度模式（spec「segment 切分维度模式」）：punctuation（默认）=
-    # 纯标点模式——间隙阈值视为无穷大（静音间隙完全不切）、word 模式说话人
-    # 变化不切分、同人二次聚合跳过；hybrid = 上一代三维混合行为。
-    # 仅 punctuation_split=True 时生效（False 时 mode 被忽略，纯间隙行为）
+    # 纯标点模式——间隙阈值视为无穷大、word 模式说话人变化不切分、同人二次
+    # 聚合跳过；hybrid = 上一代三维混合行为，在 Layer 1 文本段**内部**细分。
     punctuation_only = bool(punctuation_split) and str(segment_split_mode) == "punctuation"
     gap_threshold_eff = float("inf") if punctuation_only else float(segment_gap_threshold)
 
-    cursor = 0
+    # 词级归属（仅 word 模式消费；两模式共用同一份 items 时间戳）
+    attributions = _fill_gaps(items, _attribute_words(items, turns), turns) if items else []
+    pairs: List[Tuple[str, float, float, Optional[str]]] = [
+        (text, start, end, speaker)
+        for (text, start, end), speaker in zip(items, attributions)
+    ]
+
     segments: List[dict] = []
     # (speaker, 段时长) 原始值序列，供 speakerSummary 统计（避免二次遍历取整误差）
     dominant_records: List[Tuple[Optional[str], float]] = []
-    # 已覆盖词数（两种模式的分组均连续覆盖全部词，反查全局边界索引用）
-    consumed = 0
+    coarse_time_blocked = [(start, end) for _, start, end in coarse]
 
-    if speaker_attribution == "word":
-        # ---- word 模式：词级归属 → 洞填充 → 切分 → 同人二次聚合 ------------
-        attributions = _fill_gaps(items, _attribute_words(items, turns), turns)
-        pairs: List[Tuple[str, float, float, Optional[str]]] = [
-            (text, start, end, speaker)
-            for (text, start, end), speaker in zip(items, attributions)
-        ]
-        if punctuation_only:
-            # 纯标点模式：仅硬边界/段长切分（说话人变化不拆段），跳过同人
-            # 二次聚合（speaker_merge_gap 无操作）；段 speaker/speakers 仍由
-            # _word_vote 投票产出（段内混合说话人时 dominant 为票数多者）
-            groups = _split_groups(
-                pairs, gap_threshold_eff, max_segment_seconds, hard_boundaries
-            )
-        else:
-            groups = _split_by_speaker(
-                pairs, gap_threshold_eff, max_segment_seconds, hard_boundaries
-            )
-            groups = _merge_same_speaker(
-                groups, turns, speaker_merge_gap, max_segment_seconds,
-                blocked=[(start, end) for _, start, end in coarse],
-                hard_boundaries=hard_boundaries,
-            )
-        for group in groups:
-            seg_start = group[0][1]
-            seg_end = group[-1][2]
-            text, cursor = _extract_segment_text(
-                [(pair[0], pair[1], pair[2]) for pair in group], full_text, cursor
-            )
-            consumed += len(group)
-            # 段末边界为句末标点硬边界 → between-span 句末标点附前段末尾
-            # （跨失败块边界 puncts 已置空故自然不追加；puncts 只含句末标点）
-            if (
-                hard_boundaries is not None
-                and consumed < len(items)
-                and hard_boundaries[consumed - 1]
-            ):
-                text += puncts[consumed - 1]
-            speaker, speakers = _word_vote(group)
-            segments.append({
-                "start": round(seg_start, 3),
-                "end": round(seg_end, 3),
-                "text": text,
-                "speaker": speaker,
-                "speakers": speakers,
-            })
-            dominant_records.append((speaker, seg_end - seg_start))
-    else:
-        # ---- segment 模式：段级重叠投票（原有行为，代码路径零改动）----------
-        # 纯标点模式同样生效：gap_threshold_eff=inf 时仅硬边界/段长切分
-        for group in _split_groups(
-            items, gap_threshold_eff, max_segment_seconds, hard_boundaries
-        ):
-            seg_start = group[0][1]
-            seg_end = group[-1][2]
-            text, cursor = _extract_segment_text(group, full_text, cursor)
-            consumed += len(group)
-            # 段末边界为句末标点硬边界 → between-span 句末标点附前段末尾
-            if (
-                hard_boundaries is not None
-                and consumed < len(items)
-                and hard_boundaries[consumed - 1]
-            ):
-                text += puncts[consumed - 1]
-            # 说话人归属：segment [s, e] 与各说话人片段的重叠总时长 Σ max(0, min(e,te)-max(s,ts))
-            overlap: Dict[str, float] = {}
-            for turn in turns:
-                ov = min(seg_end, turn.end_time) - max(seg_start, turn.start_time)
-                if ov > 0:
-                    overlap[turn.speaker] = overlap.get(turn.speaker, 0.0) + ov
-            # 重叠降序（并列按说话人 id 升序，保证确定性）：首者为 dominant
-            ranked = sorted(overlap.items(), key=lambda kv: (-kv[1], kv[0]))
-            speaker = ranked[0][0] if ranked else None
-            speakers = [sp for sp, ov in ranked if ov >= _MIN_SPEAKER_OVERLAP]
-            segments.append({
-                "start": round(seg_start, 3),
-                "end": round(seg_end, 3),
-                "text": text,
-                "speaker": speaker,
-                "speakers": speakers,
-            })
-            dominant_records.append((speaker, seg_end - seg_start))
+    def _segment_vote(seg_start: float, seg_end: float) -> Tuple[Optional[str], List[str]]:
+        """segment 归属模式：段级重叠投票（既有行为，公式零改动）。
 
-    # ---- 末段尾部句末标点追加（v3 + P0 修复）-------------------------------
-    # 末词匹配终点之后的句末标点不属于任何 between-span，不追加则全文以
-    # 句末标点结尾时末段丢标点（拼接无损失效）；匹配失败回退 /
-    # punctuation_split=False 时不追加。
-    # P0 修复：尾部空 items 块进 coarse 后，其文本含句末标点；若 tail 不排除
-    # coarse 字符区间，会把粗段标点追加到正常段末尾，与粗段自身 text 标点
-    # 重复，破坏拼接无损。此处跳过 coarse 块覆盖的字符区间。
-    # 粗段不参与（其 text 取块 ASR 原文，含自身标点），故在粗段混入前对
-    # 最后产出的正常段追加。
-    # 确定 coarse 字符区间：优先用 middleware 提供的精确区间（coarse_char_spans）；
-    # 为 None 时用 coarse_text 在 full_text 中游标 find 计算（双保险兜底，
-    # 按 start 排序避免乱序错位——Change 2 补进的块追加在末尾不保证时间升序）。
-    if coarse_char_spans is not None:
-        coarse_char_ranges = [(s, e) for s, e in coarse_char_spans if s >= 0]
-    elif coarse:
-        coarse_char_ranges = []
-        pos = 0
-        for coarse_text, _, _ in sorted(coarse, key=lambda c: c[1]):
-            idx = full_text.find(coarse_text, pos)
-            if idx >= 0:
-                coarse_char_ranges.append((idx, idx + len(coarse_text)))
-                pos = idx + len(coarse_text)
-    else:
-        coarse_char_ranges = []
-    if matched and last_end >= 0 and segments:
-        tail = "".join(
-            ch for i, ch in enumerate(full_text[last_end:])
-            if ch in _SENTENCE_END_CHARS
-            and not any(s <= last_end + i < e for s, e in coarse_char_ranges)
+        重叠总时长 Σ max(0, min(e,te)-max(s,ts)) 降序（并列按 id 升序）首者
+        为 dominant，重叠 ≥ 0.1s 者入 speakers。
+        """
+        overlap: Dict[str, float] = {}
+        for turn in turns:
+            ov = min(seg_end, turn.end_time) - max(seg_start, turn.start_time)
+            if ov > 0:
+                overlap[turn.speaker] = overlap.get(turn.speaker, 0.0) + ov
+        ranked = sorted(overlap.items(), key=lambda kv: (-kv[1], kv[0]))
+        return (
+            ranked[0][0] if ranked else None,
+            [sp for sp, ov in ranked if ov >= _MIN_SPEAKER_OVERLAP],
         )
-        if tail:
-            segments[-1]["text"] += tail
 
-    # ---- 粗粒度兜底段（对齐失败块；两种归属模式均生效）----------------------
-    if coarse:
-        for coarse_text, coarse_start, coarse_end in coarse:
-            speaker, speakers = _coarse_vote(turns, coarse_start, coarse_end)
+    for b, span in enumerate(text_spans):
+        if span.is_coarse:
+            # 粗段：Layer 1 已在块内按标点切分，各子区间按字符偏移在块区间
+            # 上线性分摊时间（既有实现整块 180s 单段产出，段内标点不切分）。
+            # **刻意不施加 max_segment_seconds 强切**：粗段时间戳本就是线性
+            # 估算，再按段长切碎只会制造虚假的时间精度；且块长上限为
+            # MAX_FORCE_ALIGN_INPUT_SECONDS(180s)，按标点切分后通常远小于此。
+            # 已知局限：块内完全无标点时仍产出与块等长的单段。
+            seg_start, seg_end = _coarse_span_time(span, coarse, coarse_spans)
+            speaker, speakers = _coarse_vote(turns, seg_start, seg_end)
             segments.append({
-                "start": round(coarse_start, 3),
-                "end": round(coarse_end, 3),
-                "text": coarse_text,
+                "start": round(seg_start, 3),
+                "end": round(seg_end, 3),
+                "text": full_text[span.c_start:span.c_end],
                 "speaker": speaker,
                 "speakers": speakers,
             })
-            dominant_records.append((speaker, coarse_end - coarse_start))
-        # 粗段与正常段混合产出：segments[] 按 start 全局升序（稳定排序，
-        # 粗段插入其时间区间的正确位置，不允许简单追加导致乱序）
-        order = sorted(range(len(segments)), key=lambda i: segments[i]["start"])
-        segments = [segments[i] for i in order]
-        dominant_records = [dominant_records[i] for i in order]
+            dominant_records.append((speaker, seg_end - seg_start))
+            continue
+
+        idxs = bucket_items[b]
+        if not idxs:
+            continue  # 孤儿文本已由 _absorb_orphan_buckets 并入相邻段
+
+        # 段内 item 间的时间域强制切分（未定位粗段的遗留 ❶ 兜底）
+        sub_boundaries = [
+            any(time_forced[j] for j in range(idxs[k], min(idxs[k + 1], len(time_forced))))
+            for k in range(len(idxs) - 1)
+        ]
+
+        # ---- Layer 3：文本段之内的 item 维度细分（段长强切 / 间隙 / 说话人）
+        if speaker_attribution == "word":
+            sub_pairs = [pairs[i] for i in idxs]
+            if punctuation_only:
+                # 纯标点模式：段内仅段长强切（说话人变化不拆段、不聚合）
+                groups = _split_groups(
+                    sub_pairs, gap_threshold_eff, max_segment_seconds, sub_boundaries
+                )
+            else:
+                groups = _split_by_speaker(
+                    sub_pairs, gap_threshold_eff, max_segment_seconds, sub_boundaries
+                )
+                groups = _merge_same_speaker(
+                    groups, turns, speaker_merge_gap, max_segment_seconds,
+                    blocked=coarse_time_blocked, hard_boundaries=sub_boundaries,
+                )
+        else:
+            groups = _split_groups(
+                [items[i] for i in idxs], gap_threshold_eff, max_segment_seconds,
+                sub_boundaries,
+            )
+
+        # 子组 → 字符区间：按各子组首个已映射 item 的字符起点划界，保证各
+        # 子组区间首尾相接且合起来恰好覆盖本文本段（拼接无损）
+        group_chars: List[List[Optional[Tuple[int, int]]]] = []
+        cursor_i = 0
+        for group in groups:
+            k = len(group)
+            group_chars.append([item_chars[i] for i in idxs[cursor_i:cursor_i + k]])
+            cursor_i += k
+        bounds_list = _subgroup_char_bounds(span, groups, group_chars)
+
+        for gi, group in enumerate(groups):
+            seg_start = group[0][1]
+            seg_end = group[-1][2]
+            bounds = bounds_list[gi] if bounds_list is not None else None
+            if speaker_attribution == "word":
+                speaker, speakers = _word_vote(group)
+            else:
+                speaker, speakers = _segment_vote(seg_start, seg_end)
+            segments.append({
+                "start": round(seg_start, 3),
+                "end": round(seg_end, 3),
+                "text": _group_text(group, bounds, full_text),
+                "speaker": speaker,
+                "speakers": speakers,
+            })
+            dominant_records.append((speaker, seg_end - seg_start))
+
+    # ---- 未在 full_text 中定位到的粗段（字符区间反查失败 / find 兜底失败）---
+    # 退化为既有「整块单段 + 块区间投票」行为，保证兜底文本不丢
+    for ci, (coarse_text, cs_time, ce_time) in enumerate(coarse):
+        if ci in located_coarse:
+            continue
+        speaker, speakers = _coarse_vote(turns, cs_time, ce_time)
+        segments.append({
+            "start": round(cs_time, 3),
+            "end": round(ce_time, 3),
+            "text": coarse_text,
+            "speaker": speaker,
+            "speakers": speakers,
+        })
+        dominant_records.append((speaker, ce_time - cs_time))
+
+    # segments[] 按 start 全局升序（稳定排序，粗段插入其时间区间的正确位置）
+    order = sorted(range(len(segments)), key=lambda i: segments[i]["start"])
+    segments = [segments[i] for i in order]
+    dominant_records = [dominant_records[i] for i in order]
 
     # speakerSummary：覆盖 diarization 识别的全部说话人（从未 dominant 者为零值项）
     all_speakers = sorted({turn.speaker for turn in turns})
@@ -943,7 +1207,7 @@ def self_test() -> None:
     assert resp["segments"][0]["end"] == 30.0
     assert resp["segments"][0]["text"] == "a b"
 
-    # ---- 4. 游标匹配保留标点/空格 与 找不到回退拼接 --------------------------
+    # ---- 4. 文本划分保留标点/空格 与 找不到回退拼接 --------------------------
     full = "Hello, world. Nice to meet you."
     resp = build_segment_response(
         align_items=[ali("Hello", 0.0, 0.5), ali("world", 0.6, 1.0), ali("Nice", 2.0, 2.4), ali("meet", 2.5, 2.8)],
@@ -953,11 +1217,12 @@ def self_test() -> None:
         duration=3.0,
         speaker_attribution="segment",
     )
-    # world→Nice 之间 between-span ". " 含 ASCII 句点 → 硬边界切分（间隙
-    # 1.0 < 2.0，切分由句点驱动）；段内标点/空格/未对齐词（to）均保留，
-    # 句点附前段、末段尾部句点追加（between 中空格为非句末标点不追加）
-    assert resp["segments"][0]["text"] == "Hello, world."
-    assert resp["segments"][1]["text"] == "Nice to meet."
+    # 文本层按 ASCII 句点切分（间隙 1.0 < 2.0，切分由句点驱动）；段文本为
+    # full_text 原样切片——句点连同其后空格归入前段，末段保留未对齐词 you
+    # （既有实现只截取到末 item 匹配终点，"you" 被丢弃、末段仅剩追加句点）
+    assert resp["segments"][0]["text"] == "Hello, world. "
+    assert resp["segments"][1]["text"] == "Nice to meet you."
+    assert "".join(s["text"] for s in resp["segments"]) == full  # 拼接无损
 
     resp = build_segment_response(
         align_items=[ali("hello", 0.0, 0.5), ali("world", 0.6, 1.0)],
@@ -1255,50 +1520,86 @@ def self_test() -> None:
         (0.0, 1.0, "SPEAKER_00"), (1.5, 3.0, "SPEAKER_01"),
     ]
 
-    # ---- 12. _sentence_end_boundaries：硬边界计算 helper 级 ------------------
-    # 句号/问号/叹号/分号/ASCII 句点/换行触发硬边界；逗号/顿号不触发
-    helper_items = [
-        ("甲", 0.0, 0.5), ("乙", 0.5, 1.0), ("丙", 1.0, 1.5), ("丁", 1.5, 2.0),
-        ("戊", 2.0, 2.5), ("己", 2.5, 3.0), ("庚", 3.0, 3.5), ("辛", 3.5, 4.0),
+    # ---- 12. Layer 1/2 helper 级：_split_text_spans / _map_items_to_chars ----
+    # 句号/问号/叹号/分号/ASCII 句点/换行均触发切分；逗号/顿号不触发
+    full_text12 = "甲。乙？丙！丁；戊.己\n庚，辛"
+    spans12 = _split_text_spans(full_text12)
+    assert [(s.c_start, s.c_end) for s in spans12] == [
+        (0, 2), (2, 4), (4, 6), (6, 8), (8, 10), (10, 12), (12, 15),
     ]
-    boundaries, puncts, matched, last_end = _sentence_end_boundaries(
-        helper_items, "甲。乙？丙！丁；戊.己\n庚，辛"
+    assert [s.is_coarse for s in spans12] == [False] * 7
+    # 段文本即原样切片：相邻区间首尾相接 → 拼接无损由构造保证
+    assert "".join(full_text12[s.c_start:s.c_end] for s in spans12) == full_text12
+
+    # 连续句末标点"？！"连同其后空白归入前一段（切点落在空白之后）
+    spans12b = _split_text_spans("甲？！ 乙")
+    assert [(s.c_start, s.c_end) for s in spans12b] == [(0, 4), (4, 5)]
+    assert "甲？！ 乙"[spans12b[0].c_start:spans12b[0].c_end] == "甲？！ "
+    assert "甲？！ 乙"[spans12b[1].c_start:spans12b[1].c_end] == "乙"
+
+    # 粗段字符区间边界强制切分，且粗段内部标点照常切分（既有实现整块单段产出）
+    spans12c = _split_text_spans("甲失败。块转写！乙。", [(1, 8)])
+    assert [(s.c_start, s.c_end, s.is_coarse) for s in spans12c] == [
+        (0, 1, False), (1, 4, True), (4, 8, True), (8, 10, False),
+    ]
+    assert [s.coarse_index for s in spans12c] == [None, 0, 0, None]
+
+    # split_on_punctuation=False：只按粗段边界切分（punctuation_split=False 路径）
+    spans12d = _split_text_spans("甲。乙。丙", [(2, 4)], split_on_punctuation=False)
+    assert [(s.c_start, s.c_end, s.coarse_index) for s in spans12d] == [
+        (0, 2, None), (2, 4, 0), (4, 5, None),
+    ]
+    # 空文本 → 空列表
+    assert _split_text_spans("") == []
+
+    # _map_items_to_chars：全部命中 → 逐 item 字符区间
+    assert _map_items_to_chars(
+        [("甲", 0.0, 0.5), ("乙", 0.5, 1.0)], "甲。乙"
+    ) == [(0, 1), (2, 3)]
+
+    # **核心回归**：单 token 未命中 → 局部回退（记 None、游标不推进），其余
+    # item 位置完整保留。既有实现在此全量回退，使整份音频标点切分失效
+    # （实测 196s 音频因单个 token 未命中，75 个句末标点全部失效只切出 7 段）
+    assert _map_items_to_chars(
+        [("甲", 0.0, 0.5), ("035", 0.5, 1.0), ("乙", 1.0, 1.5)], "甲0.35乙"
+    ) == [(0, 1), None, (5, 6)]
+    # 连续多个未命中互不影响，后续仍可恢复匹配
+    assert _map_items_to_chars(
+        [("甲", 0.0, 0.5), ("X", 0.5, 1.0), ("Y", 1.0, 1.5), ("乙", 1.5, 2.0)],
+        "甲。乙",
+    ) == [(0, 1), None, None, (2, 3)]
+
+    # _assign_item_buckets：按字符起点归属；未命中继承前一个 item
+    spans12e = _split_text_spans("甲。乙。丙")
+    assert _assign_item_buckets(spans12e, [(0, 1), None, (2, 3), (4, 5)]) == [0, 0, 1, 2]
+    assert _assign_item_buckets([], []) == []
+
+    # _absorb_orphan_buckets：无 item 的段并入相邻段（优先前一段）
+    spans12f = _split_text_spans("甲。乙。丙。丁")
+    m_spans, m_items = _absorb_orphan_buckets(spans12f, [[0], [], [2], [3]])
+    assert [(s.c_start, s.c_end) for s in m_spans] == [(0, 4), (4, 6), (6, 7)]
+    assert m_items == [[0], [2], [3]]
+    # 首段为孤儿时并入后一段
+    m_spans, m_items = _absorb_orphan_buckets(spans12f, [[], [1], [2], [3]])
+    assert [(s.c_start, s.c_end) for s in m_spans] == [(0, 4), (4, 6), (6, 7)]
+    assert m_items == [[1], [2], [3]]
+    # 粗段不参与并入，且并入不得跨越粗段（否则粗段原文会被卷进正常段）
+    m_spans, m_items = _absorb_orphan_buckets(
+        _split_text_spans("甲。乙。丙", [(2, 4)]), [[], [], [2]]
     )
-    assert boundaries == [True, True, True, True, True, True, False]
-    assert puncts == ["。", "？", "！", "；", ".", "\n", ""]  # 逗号边界：False + 空串
-    assert matched is True
-    assert last_end == 15  # 末词"辛"匹配终点（full_text 共 15 字符）
+    assert [(s.c_start, s.c_end, s.is_coarse) for s in m_spans] == [
+        (0, 2, False), (2, 4, True), (4, 5, False),
+    ]
+    assert m_items == [[], [], [2]]  # 首段孤儿无法跨越粗段并入，保持独立
 
-    # 连续句末标点"？！"完整收集进 puncts；空格不收集
-    boundaries, puncts, matched, last_end = _sentence_end_boundaries(
-        [("甲", 0.0, 0.5), ("乙", 0.5, 1.0)], "甲？！ 乙"
+    # _coarse_span_time：块内子区间按字符偏移线性分摊块时间
+    spans12g = _split_text_spans("甲失败。块转写！乙。", [(1, 8)])
+    assert _coarse_span_time(spans12g[1], [("失败。块转写！", 10.0, 20.0)], [(1, 8)]) == (
+        10.0, 10.0 + 10.0 * 3 / 7,
     )
-    assert boundaries == [True] and puncts == ["？！"]
-    assert matched is True and last_end == 5
-
-    # 跨失败块边界 puncts 置空 + 强制切分（遗留 ❶ 修复）：两词时间间隙
-    # [1.0, 4.0] 与 coarse 块区间相交、between-span 含句号 → True + 置空
-    coarse_pair = [("甲", 0.0, 1.0), ("乙", 4.0, 5.0)]
-    boundaries, puncts, _, _ = _sentence_end_boundaries(coarse_pair, "甲。乙", [(1.5, 3.5)])
-    assert boundaries == [True] and puncts == [""]  # 置空，切分照常
-    # 无句末标点 + 跨失败块 → 强制切分 True（遗留 ❶：段不得横跨失败块）
-    boundaries, puncts, _, _ = _sentence_end_boundaries(coarse_pair, "甲乙", [(1.5, 3.5)])
-    assert boundaries == [True] and puncts == [""]
-    # 不相交的 coarse 区间不影响 puncts 收集与切分判定
-    boundaries, puncts, _, _ = _sentence_end_boundaries(coarse_pair, "甲。乙", [(10.0, 11.0)])
-    assert boundaries == [True] and puncts == ["。"]
-
-    # 匹配失败回退：某 item 文本不在 full_text → 全 False + 全空串 + matched=False
-    boundaries, puncts, matched, last_end = _sentence_end_boundaries(
-        [("甲", 0.0, 0.5), ("乙", 0.5, 1.0), ("丙", 1.0, 1.5)], "甲。丙"  # "乙"找不到
+    assert _coarse_span_time(spans12g[2], [("失败。块转写！", 10.0, 20.0)], [(1, 8)]) == (
+        10.0 + 10.0 * 3 / 7, 20.0,
     )
-    assert boundaries == [False, False] and puncts == ["", ""]
-    assert matched is False and last_end == -1
-
-    # 单 item 序列：返回空边界（matched=True、last_end 为末词匹配终点）
-    boundaries, puncts, matched, last_end = _sentence_end_boundaries([("甲", 0.0, 0.5)], "甲。")
-    assert boundaries == [] and puncts == []
-    assert matched is True and last_end == 1
 
     # ---- 13. 句末标点硬切分：快问快答 / 英文句点 / 逗号不切 ------------------
     # 快问快答（spec Scenario）：两句间隙仅 0.3s（< 阈值）→ 句号处切分两段，
@@ -1327,8 +1628,10 @@ def self_test() -> None:
         duration=2.4,
     )
     assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.5), (1.8, 2.4)]
-    assert resp["segments"][0]["text"] == "Nice to meet you."  # 句点附前段
-    assert resp["segments"][1]["text"] == "See you."          # 末段尾部句点追加
+    # 句点连同其后空格归入前段；末段延伸至文末，尾部句点天然含在段内
+    assert resp["segments"][0]["text"] == "Nice to meet you. "
+    assert resp["segments"][1]["text"] == "See you."
+    assert "".join(s["text"] for s in resp["segments"]) == "Nice to meet you. See you."
 
     # 逗号不切分（spec Scenario）：小间隙 0.2s + 仅有逗号 → 不切，逗号保留段内
     resp = build_segment_response(
@@ -1355,7 +1658,8 @@ def self_test() -> None:
     assert [s["text"] for s in resp["segments"]] == ["说号就行。", "啊？", "说吧"]
     assert "".join(s["text"] for s in resp["segments"]) == resp["text"]
 
-    # 连续句末标点"？！ "（spec Scenario）：前段追加"？！"，空格不追加
+    # 连续句末标点"？！ "（spec Scenario）：切点落在标点串及其后空白之后，
+    # "？！ " 整体归入前段（既有实现丢弃空格，"".join 拼接有损）
     resp = build_segment_response(
         align_items=[ali("啊", 0.0, 0.5), ali("什么", 1.0, 1.5)],
         diarization=[],
@@ -1363,28 +1667,30 @@ def self_test() -> None:
         language_name="Chinese",
         duration=1.5,
     )
-    assert [s["text"] for s in resp["segments"]] == ["啊？！", "什么"]
+    assert [s["text"] for s in resp["segments"]] == ["啊？！ ", "什么"]
+    assert "".join(s["text"] for s in resp["segments"]) == "啊？！ 什么"
 
-    # 跨失败块边界不追加（spec Scenario）：甲|乙 隔失败块（块文本含多个句末
-    # 标点）→ 前段无垃圾标点后缀；粗段 text 含自身原文标点、无重复；混合
-    # 场景拼接无损：按 start 排序后 "".join(segments[].text) == text
+    # 跨失败块边界（spec Scenario）：甲|乙 隔失败块（块文本含多个句末标点）→
+    # 正常段不横跨失败块；**粗段内部按标点继续切分**（既有实现整块单段产出，
+    # 段内标点不切分），各子区间按字符偏移线性分摊块时间；混合场景拼接无损
     resp = build_segment_response(
         align_items=[ali("甲", 0.0, 1.0), ali("乙", 4.0, 5.0)],  # 间隙 [1.0, 4.0]
         diarization=[("SPEAKER_00", 0.0, 5.0)],
         full_text="甲失败。块转写！乙。",
         language_name="Chinese",
         duration=5.0,
-        coarse_chunks=[("失败。块转写！", 1.5, 3.5)],  # 与间隙相交 → puncts 置空
+        coarse_chunks=[("失败。块转写！", 1.5, 3.5)],  # 字符区间由 find 定位
     )
     segs = resp["segments"]
-    assert [(s["start"], s["end"]) for s in segs] == [(0.0, 1.0), (1.5, 3.5), (4.0, 5.0)]
-    # between-span"失败。块转写！"跨失败块 → 置空不追加，前段无"。。？。"垃圾后缀
-    assert segs[0]["text"] == "甲"
-    # 粗段取块 ASR 原文（含自身句末标点，不与任何段重复）
-    assert segs[1]["text"] == "失败。块转写！"
-    # 末段尾部句号追加
-    assert segs[2]["text"] == "乙。"
-    assert "".join(s["text"] for s in segs) == resp["text"]
+    # 粗段 [1.5, 3.5] 按块内标点切成 2 段，时间按字符偏移分摊（10 字符中占 3 + 4）
+    assert [(s["start"], s["end"]) for s in segs] == [
+        (0.0, 1.0), (1.5, 2.357), (2.357, 3.5), (4.0, 5.0),
+    ]
+    assert segs[0]["text"] == "甲"          # 正常段不含失败块文本
+    assert segs[1]["text"] == "失败。"       # 粗段子区间 1（原样切片，含自身标点）
+    assert segs[2]["text"] == "块转写！"     # 粗段子区间 2
+    assert segs[3]["text"] == "乙。"         # 末段延伸至文末
+    assert "".join(s["text"] for s in segs) == resp["text"]  # 拼接无损
 
     # ---- 15. 无标点间隙阈值 2.0：用户场景回归与边界值 -------------------------
     # 用户场景回归 1（spec Scenario 句中停顿不再切碎）：无标点 0.875s 停顿
@@ -1475,8 +1781,8 @@ def self_test() -> None:
         (0.0, 1.0, "SPEAKER_00"), (3.5, 4.5, "SPEAKER_00"),
     ]
 
-    # punctuation_split=False（spec Scenario 线上误切即时关闭）：有标点小间隙
-    # → 跳过硬边界计算不切分；句号随合并自然保留段内，末段尾部不追加
+    # punctuation_split=False（spec Scenario 线上误切即时关闭）：不按标点切分，
+    # 纯间隙/段长行为（word 模式含说话人变化）；段文本仍为 full_text 原样切片
     resp = build_segment_response(
         align_items=[ali("说号就行", 0.0, 1.0), ali("啊", 1.3, 1.6)],
         diarization=[],
@@ -1486,7 +1792,8 @@ def self_test() -> None:
         punctuation_split=False,
     )
     assert [(s["start"], s["end"]) for s in resp["segments"]] == [(0.0, 1.6)]
-    assert resp["segments"][0]["text"] == "说号就行。啊"
+    # 既有实现末段丢尾部"？"（matched=False 时不追加）；新实现末段延伸至文末
+    assert resp["segments"][0]["text"] == "说号就行。啊？"
 
     # 完整旧行为回归（spec Scenario）：off + 显式 gap 0.8，同人间隙 1.0 →
     # 切分后同人聚合并回一段（升级前 0.8s 阈值 + merge_gap 2.0 的行为）
@@ -1500,7 +1807,7 @@ def self_test() -> None:
         punctuation_split=False,
     )
     assert [(s["start"], s["end"], s["speaker"]) for s in resp["segments"]] == [(0.0, 3.0, "SPEAKER_00")]
-    assert resp["segments"][0]["text"] == "今天不错。明天更好"
+    assert resp["segments"][0]["text"] == "今天不错。明天更好。"  # 末段延伸至文末
 
     # ---- 17. match 失败回退 / 说话人变化无标点照切 / segment 模式标点切分 -----
     # match 失败回退（spec Scenario 标点信息缺失回退，hybrid 模式）：item
@@ -1685,9 +1992,10 @@ def self_test() -> None:
         assert segs[1]["text"] == "失败块文本"  # 粗段取块 ASR 原文（仅计入一次）
         assert "".join(s["text"] for s in segs) == resp["text"]  # 交界无标点 → 拼接一致
 
-    # ---- 19. P0 修复：尾部空 items 块标点不重复（coarse_char_spans 精确区间）--
-    # 尾部空 items 块进 coarse 后，其文本含句末标点；tail 逻辑须排除 coarse
-    # 字符区间，否则会把粗段标点追加到正常段末尾，与粗段自身标点重复。
+    # ---- 19. P0 场景：尾部空 items 块标点不重复（coarse_char_spans 精确区间）--
+    # 尾部空 items 块进 coarse 后，其文本含句末标点。既有实现靠独立的 tail 逻辑
+    # 跳过 coarse 字符区间来避免重复追加；新实现由 Layer 1 在**字符域**直接把
+    # 粗段切出去，末段天然不会延伸到粗段文本，无需任何补偿逻辑。
     # 场景：正常块"甲" + 尾部空 items 块"乙说完了。"
     # 精确区间：coarse_char_spans=[(1, 6)]（"甲"1 字符，"乙说完了。"5 字符）
     resp = build_segment_response(
@@ -1701,7 +2009,7 @@ def self_test() -> None:
     )
     segs = resp["segments"]
     assert [(s["start"], s["end"]) for s in segs] == [(0.0, 1.0), (1.5, 3.0)]
-    assert segs[0]["text"] == "甲"  # tail 排除 coarse 区间，不追加尾部标点
+    assert segs[0]["text"] == "甲"  # 字符域切割，前段不含粗段文本与其标点
     assert segs[1]["text"] == "乙说完了。"  # 粗段含自身标点
     assert "".join(s["text"] for s in segs) == resp["text"]  # 拼接无损
 
@@ -1727,6 +2035,69 @@ def self_test() -> None:
         language_name="Chinese",
         duration=1.0,
     )
-    assert resp["segments"][0]["text"] == "甲。"  # tail 取末尾句号
+    assert resp["segments"][0]["text"] == "甲。"  # 末段延伸至文末
+
+    # ---- 20. 脱敏回归：证件号念读导致 token 失配（局部回退核心场景）----------
+    # 真实故障：196.544s 执法音频中身份证号被重复念读（"三零二X。三零二X。"），
+    # 经 aligner 的 clean_token 剥掉句号后拉丁/数字连串被合并为 token "XGTDCH"
+    # （原文实为 "X。GTDCH"）→ find 失败 → 既有实现**全量回退**，全文 75 个
+    # 句末标点全部失效、只剩 30s 段长强切（仅切出 7 段，拼接还少 5 字）。
+    # 此处用**脱敏**的同类结构假数据复现该模式（真实证件号/车牌不进仓库），
+    # 验证局部回退后：标点切分不再受单 token 失配牵连，且拼接无损。
+    import unicodedata
+
+    def _aligner_tokens(text: str) -> List[str]:
+        """复刻 Qwen3ForceAlignProcessor 分词：剥掉标点与空白后拉丁/数字连串合并。"""
+
+        def _kept(ch: str) -> bool:
+            return ch == "'" or unicodedata.category(ch).startswith(("L", "N"))
+
+        toks: List[str] = []
+        for seg in text.split():
+            cleaned = "".join(ch for ch in seg if _kept(ch))
+            if not cleaned:
+                continue
+            buf: List[str] = []
+            for ch in cleaned:
+                if 0x4E00 <= ord(ch) <= 0x9FFF:  # CJK 逐字成 token
+                    if buf:
+                        toks.append("".join(buf))
+                        buf = []
+                    toks.append(ch)
+                else:
+                    buf.append(ch)
+            if buf:
+                toks.append("".join(buf))
+        return toks
+
+    case_text = (
+        "我找他，找他了。问他是不是变道，是吧？身份证。先说身份证号。"
+        "身幺三幺。幺三幺。五幺七K。五幺七K。XQPZW三九。"
+        "看这个样子，应该是你变道，变道了。啊。看这个，这个，这个从你这个角度啊。"
+        "啊。我看是应该是你变道，没没注意看他打车。啊，对对对。是吧？对对。"
+        "要是打车，要是他要是他要是变道的话，他不会发生，不会像你这么歪歪着这么歪。"
+        "啊，对，是我往这边并的，是吧？他顶着我了。对。"
+        "这个我们到达现场以后，你们发生交通事故，后方未摆放警告标志。"
+        "发生事故以后，后边必须放三角架，知道吗？"
+        "你们没有放，我们到了以后你们都没有。我是想放，我卸不下来。"
+    )
+    case_toks = _aligner_tokens(case_text)
+    # 复现真实根因：存在"清洗后在原文中不连续存在"的 token
+    assert "KXQPZW" in case_toks
+    assert case_text.find("KXQPZW") < 0
+    case_dur = 120.0
+    step20 = case_dur / (len(case_toks) + 1)
+    case_items = [
+        ali(t, round(step20 * (i + 1), 3), round(step20 * (i + 1) + step20 * 0.6, 3))
+        for i, t in enumerate(case_toks)
+    ]
+    resp = build_segment_response(case_items, [], case_text, "Chinese", case_dur)
+    segs20 = resp["segments"]
+    # 全量回退下 120s 只会被 30s 段长切成约 5 段；局部回退后回到标点量级
+    assert len(segs20) == 25, len(segs20)
+    assert "".join(s["text"] for s in segs20) == case_text  # 拼接无损
+    # 证件号两句各自独立成段（既有实现会把它们并进 30s 粗块且不切分）
+    texts20 = [s["text"] for s in segs20]
+    assert "五幺七K。" in texts20 and "XQPZW三九。" in texts20
 
     print("pipeline self_test ok")

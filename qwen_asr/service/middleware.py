@@ -526,6 +526,11 @@ def _run_asr_align(
             if txt.strip()
         ]
     # 基于块索引精确计算每个 coarse 块的字符区间（Change 4）。
+    # **语义升级**：本项原为末段尾部标点追加的精度优化，现已成为 pipeline
+    # Layer 1 的**主路径依赖**——文本切分据此在字符域切割粗段边界（替代既有
+    # _gap_blocked 的时间域判定）。未定位的块（(-1, -1)）由 pipeline 退化为
+    # 整块单段 + 时间域强制切分兜底，不影响兜底文本不丢的既有承诺。
+    #
     # coarse 条目 → 块索引映射：_coarse_interval 返回的 start 就是 offset
     # 原值（min 截断只作用于 end），用 start == offset 反查块索引。
     # 不用 coarse_idx_set（后者只含 Change 1 的块，会漏整批异常和
@@ -542,8 +547,9 @@ def _run_asr_align(
             char_end = char_start + len(per_chunk[chunk_idx][1])
             coarse_char_spans.append((char_start, char_end))
         else:
-            # 反查失败（理论上不应发生），占位 -1 被 pipeline 的 if s >= 0
-            # 过滤——该块标点不排除（无实际影响，反查不应失败）
+            # 反查失败（理论上不应发生）：占位 (-1, -1)，pipeline 按"未定位"
+            # 处理——该块退化为整块单段（块区间投票 + 块 ASR 原文），并在
+            # 时间域强制切分，保证兜底文本不丢
             coarse_char_spans.append((-1, -1))
     return full_text, merged_lang, merged, coarse_chunks, coarse_char_spans
 

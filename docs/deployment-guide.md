@@ -182,6 +182,23 @@ mock 端到端（驱动真实 _run_asr_align）        13/13 通过，原失败�
 性能                                         8800 字 / 8000 items 构建耗时 ~11ms
 ```
 
+### 2.6 diarize-tune 镜像新增能力（分支 feat/punct-split-diarization-tuning）
+
+在 align-fallback 之上继续叠加一层（同样全量覆盖 `qwen_asr/`，依赖不变），新增参数
+`--diarization-min-cluster-size`，解决"**发言很少的说话人被吞掉、误并入他人**"：
+
+- pyannote AHC 在聚类**结束后**，会把样本数少于该值的簇**整个合并到最近簇**；该值
+  硬编码为 **12** 且此前不可调。执法记录仪里只说几句话的一方首当其冲，表现为
+  "两人被识别成一个 speaker"；
+- **调 `--diarization-clustering-threshold` 救不回来**——阈值只决定聚类阶段怎么切，
+  管不了事后的小簇合并，两者是不同阶段的不同超参；
+- 仅 `--diarizer-embedding campplus` 生效（wespeaker 走 VBx+PLDA，无此超参，传入会
+  WARNING 并忽略）。执法场景建议 `3`（合法值正整数，`1` = 关闭小簇合并，需配合阈值
+  防止过分割）。
+
+内网重新构建（免重传 15GB 镜像，构建上下文仅 ~780KB）的完整操作步骤、启动命令与
+回滚方法见 **`docs/intranet-incremental-build.md`**。
+
 ---
 
 ## 3. 部署前提（目标机要求）

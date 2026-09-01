@@ -1,0 +1,51 @@
+# diarize-tune 镜像：在内网已构建的 qwen3-asr-offline:cu128-align-fallback
+# （hotfix 热修 + 标点感知分段 + 说话人调参 + CAM++ + 对齐逐块空 items 兜底
+# + 文本优先切分解耦）之上，全量覆盖 qwen_asr/ 包代码（不重装依赖、不重打
+# 大镜像）。
+#
+# 本版新增（commit 15bef31「expose AHC min_cluster_size to keep low-talking
+# speakers」，详见 docs/diarization-tuning-guide.md §2.4 / 步骤 3）：
+#   1. 新增启动参数 --diarization-min-cluster-size（正整数，默认仍为管线值 12）：
+#      把 pyannote AHC 的"小簇合并阈值"从硬编码暴露为可调；
+#   2. 解决的问题：聚类结束后样本数少于该值的簇会被**整个合并到最近簇**——
+#      执法记录仪里发言很少的一方（只说几句话）会被吞掉、误并入他人，
+#      表现为"两人被识别成一个 speaker"，且**调聚类阈值救不回来**（阈值只
+#      决定聚类阶段怎么切，管不了事后的小簇合并）；
+#   3. 仅 --diarizer-embedding campplus 生效（wespeaker 走 VBx+PLDA 无此超参，
+#      传入会 WARNING 并忽略）；
+#   4. 实现上新增 SpeakerDiarizer.apply_clustering_hparams()——多个 AHC 超参
+#      一次性写入（instantiate 只覆盖 dict 给出的键，分次调用会留下日志无法
+#      区分的"部分生效"中间态）。仅传 threshold 时仍走既有
+#      apply_clustering_threshold，wespeaker 路径行为零变化。
+#
+# 覆盖方式：删除基础镜像内旧版包代码目录后，以本地仓库 qwen_asr/ 完整替换——
+# 镜像内代码与本地一字不差，无旧文件残留。pip dist-info 安装元数据（RECORD
+# 哈希）不随覆盖更新，不影响运行时 import 与服务启动（与既有 overlay 做法一致）。
+#
+# 本机构建（在仓库根目录执行，构建上下文仅需 qwen_asr/ 目录）：
+#   docker build -f docker/Dockerfile-qwen3-asr-diarize-tune \
+#     -t qwen3-asr-offline:cu128-diarize-tune .
+#
+# 内网构建（免重传基础镜像，推荐）：把本文件与整个 qwen_asr/ 目录放到目标机
+#   /data/patch/{Dockerfile, qwen_asr/...}，
+#   cd /data/patch && docker build -t qwen3-asr-offline:cu128-diarize-tune .
+#   （目标机已有基础镜像 qwen3-asr-offline:cu128-align-fallback，仅需传输源码）
+FROM qwen3-asr-offline:cu128-align-fallback
+
+# 全量覆盖：先删旧包代码目录（dist-info 元数据保留，pip 依赖解析不受影响），
+# 再完整复制本地 qwen_asr/（含 core/inference/service/cli 全部模块与
+# inference/assets/ 资源文件、inference/campplus_speaker_embedding.py CAM++ 声纹
+# wrapper；__pycache__/*.pyc 已被 .dockerignore 排除）
+RUN rm -rf /usr/local/lib/python3.10/dist-packages/qwen_asr
+COPY qwen_asr/ /usr/local/lib/python3.10/dist-packages/qwen_asr/
+
+# 构建期校验：
+# 1. 全量语法编译（防截断文件进镜像；顺带生成 __pycache__ 字节码）
+# 2. pipeline 分段逻辑离线自测（self_test 纯标准库、无 GPU 依赖，覆盖
+#    punctuation/hybrid 两模式断言组 + 文本优先切分 + 脱敏回归 fixture）
+# 3. 判别本版新增能力：serve.py 暴露 --diarization-min-cluster-size、
+#    diarizer 提供 apply_clustering_hparams（缺任一即构建失败）
+RUN python3 -m compileall -q /usr/local/lib/python3.10/dist-packages/qwen_asr \
+ && python3 -c "import importlib.util; spec = importlib.util.spec_from_file_location('punct_pipeline', '/usr/local/lib/python3.10/dist-packages/qwen_asr/service/pipeline.py'); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); m.self_test()" \
+ && grep -q 'diarization-min-cluster-size' /usr/local/lib/python3.10/dist-packages/qwen_asr/cli/serve.py \
+ && grep -q 'apply_clustering_hparams' /usr/local/lib/python3.10/dist-packages/qwen_asr/inference/qwen3_speaker_diarizer.py

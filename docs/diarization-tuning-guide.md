@@ -53,6 +53,21 @@ docker logs qwen3-asr 2>&1 | grep -E "聚类阈值|embedding="
 
 > 即使生效也要注意方向：spec 的「默认值纪律」明确不在离线环境猜测管线默认阈值。若默认值本就低于 0.5，则该设定反而**更倾向合并**，适得其反，需实测确认。
 
+### 2.4 `min_cluster_size`：发言少的说话人会被整个吞掉（⚠️ 执法场景高发）
+
+pyannote AHC 在聚类**结束之后**还有一道"小簇合并"：样本数少于 `min_cluster_size` 的簇，会被**整个合并到最近的簇**。项目里该值此前硬编码：
+
+```python
+_AHC_DEFAULTS = {"method": "centroid", "threshold": 0.515771, "min_cluster_size": 12}
+```
+
+**后果**：执法记录仪里发言很少的一方（只搭了几句话的当事人、只在开头说了两句的民警），其簇若不足 12 个窗口，就会被**并入另一个人的簇**——表现为"两人被识别成一个 speaker"，且**调 `--diarization-clustering-threshold` 救不回来**（阈值只决定聚类阶段怎么切，管不了事后的小簇合并）。
+
+现已暴露为启动参数 `--diarization-min-cluster-size`（见 §3 步骤 3）。
+
+> 注意：该超参**只存在于 campplus/AHC 路径**。`wespeaker` 走 VBx + PLDA，无此参数，
+> 传了会 WARNING 并忽略。
+
 ## 3. 改动清单（按优先级）
 
 ### 步骤 1：补齐人数上界（零风险，先做）
@@ -84,7 +99,39 @@ docker logs qwen3-asr 2>&1 | grep -E "聚类阈值|embedding="
 
 **一键回退**：改回 `--diarizer-embedding wespeaker`（或删除该参数）。
 
-### 步骤 3：切分模式 A/B（最后评估，属取舍）
+### 步骤 3：调 `--diarization-min-cluster-size`（解决"说话少的人被吞掉"）
+
+**前提**：仅在 `--diarizer-embedding campplus` 下生效（`wespeaker` 传了会 WARNING 并忽略）。
+
+```bash
+# 与步骤 2 的 CAM++ 参数一起追加
+--diarization-min-cluster-size 3
+```
+
+取值建议：
+
+| 值 | 语义 | 适用 |
+|---|---|---|
+| `12`（默认） | pyannote 3.1 官方调优值 | 每人发言都充足的长音频 |
+| **`3` ~ `4`** | 保留发言很少的说话人 | **执法记录仪推荐起点** |
+| `2` | 更激进地保留小簇 | 有一方只说一两句话时 |
+| `1` | **关闭小簇合并** | 极端场景；需配合 threshold 防止过分割 |
+
+> **设为 1 不等于"一定更好"**：关闭小簇合并后，噪声产生的孤立小簇也会各自成类，
+> 可能把一个人分成多个 speaker。此时应**上调** `--diarization-clustering-threshold`
+> 让真正的同人先并起来，而不是放任小簇乱飞。
+
+**验证是否生效**：
+
+```bash
+docker logs qwen3-asr 2>&1 | grep "聚类超参"
+# 预期：说话人聚类超参已覆写为 {'threshold': 0.5, 'min_cluster_size': 3}（生效机制: instantiate）
+```
+
+> 只传了 `--diarization-clustering-threshold`（未传 min_cluster_size）时日志仍是
+> `说话人聚类阈值已覆写为 ...`（沿用既有实现，行为不变）。
+
+### 步骤 4：切分模式 A/B（最后评估，属取舍）
 
 默认 `punctuation` 模式下句中说话人变化**不触发切分**，段 `speaker` 为段内词归属 dominant。快问快答场景下一方的发言会被整体归入另一方。
 
@@ -123,9 +170,13 @@ hybrid 会在说话人变化处切分（无标点处照切），但会退回「�
 1. 基线（当前配置）
 2. 加 `--diarization-max-speakers 2`
 3. 加 `--diarizer-embedding campplus --diarizer-embedding-model <dir>`
-4. 加 `--segment-split-mode hybrid`（最后评估）
+4. **加 `--diarization-min-cluster-size 3`**（仅在步骤 3 的 campplus 已启用后有意义）
+5. 加 `--segment-split-mode hybrid`（最后评估）
 
 每次变更后重启容器，重跑同批样本，记录上表指标。
+
+> 样本里应包含**「一方发言很少」**的音频（只说几句话）。这条最能区分步骤 3 与步骤 4
+> 的效果——`min_cluster_size` 正是为此而加，阈值调不出来的差异它才调得出来。
 
 ### 4.4 判定标准
 
@@ -133,10 +184,14 @@ hybrid 会在说话人变化处切分（无标点处照切），但会退回「�
 |---|---|
 | 单人独白音频的 `speakerCount` | 应等于 1（验证过分割是否消除） |
 | 两人对话音频的 `speakerCount` | 应等于 2（验证欠分割是否消除） |
+| **「发言很少的一方」是否被单独识别** | 步骤 4 后应能独立成类（这是 `min_cluster_size` 的直接判据） |
 | `speakers` 长度 ≥ 2 的段占比 | 越低越好（说明段内不再混人） |
 | dominant 票数占比 | 越接近 1 越好（说明 dominant 可信） |
 
 若步骤 3 后「两人判成一人」的比例**未显著下降**，按 spec 约定：保持 `wespeaker` 默认，记录结论，触发 VBx + PLDA 重估升级路径的立项评估（需 CN-Celeb 类标注语料，非当前范围）。
+
+若步骤 3 已分离但**发言少的一方仍被吞**，那就是 §2.4 的小簇合并所致——按步骤 4 降
+`--diarization-min-cluster-size`，这与此前调阈值是两个不同阶段的问题。
 
 ## 5. 参数速查
 
@@ -146,7 +201,8 @@ hybrid 会在说话人变化处切分（无标点处照切），但会退回「�
 | `--diarizer-embedding-model` | None | CAM++ 模型目录 | 仅 `campplus` 生效 |
 | `--diarization-min-speakers` | None | 聚类类数下限 | 服务级默认，请求级可覆盖 |
 | `--diarization-max-speakers` | None | 聚类类数上限 | 服务级默认，请求级可覆盖 |
-| `--diarization-clustering-threshold` | None（管线默认） | 聚类阈值，合法区间 `(0, 2)` | **调低更倾向拆分**；过度调低会过分割一人成多。须先在日志确认生效机制 |
+| `--diarization-clustering-threshold` | None（管线默认） | 聚类阈值，合法区间 `(0, 2)`；**距离空间**（余弦相似度 = 1 − 距离） | **调低更倾向拆分**；过度调低会过分割一人成多。须先在日志确认生效机制 |
+| `--diarization-min-cluster-size` | None（管线默认 12） | 聚类后小簇合并阈值，正整数 | **调低保留发言少的说话人**；`1` = 关闭小簇合并（需配合 threshold 防过分割）。**仅 `campplus` 生效**，wespeaker 传了会 WARNING 并忽略 |
 | `--segment-split-mode` | `punctuation` | `punctuation` 不按说话人切分 / `hybrid` 按说话人切分 | 取舍项，需 A/B |
 
 > 注意：`--segment-gap-threshold` 与 `--speaker-merge-gap` **仅在 `hybrid` 模式生效**，punctuation 模式下为无操作参数。

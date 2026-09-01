@@ -348,7 +348,8 @@ docker run -d --name qwen3-asr --restart unless-stopped \
 | `--pyannote-token` | 无 | HF 访问令牌（联网加载门控模型用）。**离线本地路径加载不需要**，缺省依次取环境变量 `PYANNOTE_API_TOKEN` / `HF_TOKEN` |
 | `--diarization-min-speakers` | 无 | 说话人数下限服务级默认（无 = 不约束）：请求级 `min_speakers` 未传时回退到此值，透传 pyannote 聚类约束；**固定人数场景（如已知双人对话）设 min=max=2 效果最直接**（缓解相近说话人被合并） |
 | `--diarization-max-speakers` | 无 | 说话人数上限服务级默认（无 = 不约束）：请求级 `max_speakers` 未传时回退到此值；与下限同时设置时下限不得大于上限（启动报错） |
-| `--diarization-clustering-threshold` | 无 | 说话人聚类阈值服务级覆写，合法区间 (0, 2)；**调低更倾向拆分说话人**（过度调低会过分割一人成多）；无 = 管线默认（wespeaker/VBx 与 campplus/AHC 两条路径默认值不同，以部署机模型 config.yaml 为准）。仅 diarizer 启用时生效 |
+| `--diarization-clustering-threshold` | 无 | 说话人聚类阈值服务级覆写，合法区间 (0, 2)；**调低更倾向拆分说话人**（过度调低会过分割一人成多）；无 = 管线默认（wespeaker/VBx 与 campplus/AHC 两条路径默认值不同，以部署机模型 config.yaml 为准）。仅 diarizer 启用时生效。**注意是距离空间**：余弦相似度 ≈ 1 − 该值 |
+| `--diarization-min-cluster-size` | 无（管线默认 12） | 聚类最小簇大小服务级覆写（正整数）。聚类结束后样本数少于该值的簇会被**合并到最近簇**——**发言很少的说话人（只说几句话）会被整个吞掉**。此类场景建议设 `2`~`4`；`1` = 关闭小簇合并（需配合 `--diarization-clustering-threshold` 防过分割）。**仅 `--diarizer-embedding campplus` 生效**，wespeaker 模式传入会 WARNING 并忽略。详见 `docs/diarization-tuning-guide.md` §2.4 |
 | `--diarizer-embedding` | `wespeaker` | diarization 声纹向量化模式：`wespeaker`（默认，community-1 管线现状，英文域声纹 + VBx 聚类）/ `campplus`（CAM++ 中文声纹 + 3.1 式 AHC 余弦聚类，缓解中文相近男声被合并，见 §2.4；需配 `--diarizer-embedding-model`） |
 | `--diarizer-embedding-model` | 无 | CAM++ 声纹模型本地目录（`campplus` 模式**必填**，含 `campplus_cn_common.bin` + `config.yaml`）；`wespeaker` 模式传入被忽略并告警。目录缺失/注入失败启动即报错（不静默回退） |
 | `--aligner-device` | `cuda:0` | 对齐模型设备；分卡部署时如 `cuda:1` |
@@ -462,7 +463,7 @@ docker run --security-opt seccomp=unconfined -d --name qwen3-asr \
 > 说明：该拓扑用旧版 Docker 的 `--runtime=nvidia` + `NVIDIA_VISIBLE_DEVICES` 写法
 > （Docker ≥19.03 可用 `--gpus '"device=0,1"'`，见本节末）。
 >
-> **此配置有两点建议调整**（详见 `docs/diarization-tuning-guide.md`）：
+> **此配置有三点建议调整**（详见 `docs/diarization-tuning-guide.md`）：
 >
 > 1. `--diarization-min-speakers 2` 未配上界 → 单人独白会被**强行劈成两类**。
 >    人数固定时补 `--diarization-max-speakers 2`；人数不定则去掉下限，改由请求级参数指定。
@@ -470,6 +471,11 @@ docker run --security-opt seccomp=unconfined -d --name qwen3-asr \
 >    `docker logs qwen3-asr 2>&1 | grep -E "聚类阈值"`
 >    出现"聚类阈值已覆写（生效机制: …）"才算生效；出现"应用失败"则该参数无效，
 >    正按管线默认阈值运行。即便生效也建议 A/B 确认方向（调低更倾向拆分）。
+> 3. **当前未启用 CAM++**（`--diarizer-embedding` 默认 `wespeaker`），中文声纹区分
+>    能力受限。若说话人误合并，按调优指南依次启用 `campplus` 并加
+>    `--diarization-min-cluster-size 3`（后者解决"发言少的一方被整簇吞掉"，
+>    调 threshold 无法解决该问题）。启用后日志确认：
+>    `docker logs qwen3-asr 2>&1 | grep -E "CAM\+\+|聚类超参"`
 
 **三卡（各自独占，显存互不竞争）：**
 

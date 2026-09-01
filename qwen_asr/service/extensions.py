@@ -111,6 +111,7 @@ class ExtensionState:
     diarization_min_speakers: Optional[int] = None
     diarization_max_speakers: Optional[int] = None
     diarization_clustering_threshold: Optional[float] = None
+    diarization_min_cluster_size: Optional[int] = None
     diarizer_embedding: str = "wespeaker"
     diarizer_embedding_model: Optional[str] = None
     max_audio_seconds: float = 3600.0
@@ -404,6 +405,9 @@ def load_extensions(
     diarization_clustering_threshold = getattr(ext_args, "diarization_clustering_threshold", None)
     if diarization_clustering_threshold is not None:
         diarization_clustering_threshold = float(diarization_clustering_threshold)
+    diarization_min_cluster_size = getattr(ext_args, "diarization_min_cluster_size", None)
+    if diarization_min_cluster_size is not None:
+        diarization_min_cluster_size = int(diarization_min_cluster_size)
 
     # diarizer 禁用时说话人调优参数无效果（告警但不阻断，比照 embedding 先例）
     if not diarizer_name:
@@ -413,6 +417,7 @@ def load_extensions(
                 ("--diarization-min-speakers", diarization_min_speakers),
                 ("--diarization-max-speakers", diarization_max_speakers),
                 ("--diarization-clustering-threshold", diarization_clustering_threshold),
+                ("--diarization-min-cluster-size", diarization_min_cluster_size),
             )
             if value is not None
         ]
@@ -422,24 +427,49 @@ def load_extensions(
                 " / ".join(ineffective),
             )
 
-    # 聚类阈值防御式应用（diarizer 加载后 best-effort，全部机制不可用则 WARNING
+    # 聚类超参防御式应用（diarizer 加载后 best-effort，全部机制不可用则 WARNING
     # 后正常启动——spec「聚类阈值服务级覆写」：AHC 路径 instantiate 为预期主机制）
-    if diarization_clustering_threshold is not None and diarizer is not None:
-        mechanism = diarizer.apply_clustering_threshold(diarization_clustering_threshold)
-        if mechanism:
-            logger.info(
-                "说话人聚类阈值已覆写为 %s（生效机制: %s；调低更倾向拆分说话人，"
-                "过度调低会过分割一人成多）",
-                diarization_clustering_threshold,
-                mechanism,
-            )
-        else:
+    if diarizer is not None:
+        # min_cluster_size 仅 campplus/AHC 路径存在（wespeaker 走 VBx+PLDA，无该超参）
+        if diarization_min_cluster_size is not None and str(diarizer_embedding) != "campplus":
             logger.warning(
-                "聚类阈值 %s 应用失败：当前管线不支持任一探测机制"
-                "（instantiate 超参 / clustering_threshold 属性 / 嵌套超参覆写），"
-                "将按管线默认阈值运行（具体默认值以部署机模型 config.yaml 为准）。",
-                diarization_clustering_threshold,
+                "--diarization-min-cluster-size %s 仅 --diarizer-embedding campplus "
+                "生效（当前 embedding=%s 走 VBx+PLDA 聚类，无此超参），已忽略。",
+                diarization_min_cluster_size,
+                diarizer_embedding,
             )
+            diarization_min_cluster_size = None
+
+        hparams: Dict[str, Any] = {}
+        if diarization_clustering_threshold is not None:
+            hparams["threshold"] = diarization_clustering_threshold
+        if diarization_min_cluster_size is not None:
+            hparams["min_cluster_size"] = diarization_min_cluster_size
+        if hparams:
+            # 多超参必须一次性写入：pyannote instantiate 只覆盖 dict 给出的键，
+            # 分次调用一旦中途失败会留下"部分生效"的中间态，日志无法判断实际配置。
+            # 仅阈值一项时沿用既有 apply_clustering_threshold（保留其 hparams 备选探测）。
+            if len(hparams) == 1 and "threshold" in hparams:
+                mechanism = diarizer.apply_clustering_threshold(
+                    diarization_clustering_threshold
+                )
+            else:
+                mechanism = diarizer.apply_clustering_hparams(**hparams)
+            if mechanism:
+                logger.info(
+                    "说话人聚类超参已覆写为 %s（生效机制: %s；threshold 调低更倾向"
+                    "拆分说话人、过度调低会过分割一人成多；min_cluster_size 调低可"
+                    "保留发言很少的说话人、设为 1 关闭小簇合并）",
+                    hparams,
+                    mechanism,
+                )
+            else:
+                logger.warning(
+                    "聚类超参 %s 应用失败：当前管线不支持任一探测机制"
+                    "（instantiate 超参 / clustering 组件 instantiate / 属性直写），"
+                    "将按管线默认超参运行。",
+                    hparams,
+                )
 
     scheduler = GpuScheduler(
         max_concurrent_tasks=int(getattr(ext_args, "max_concurrent_tasks", 2) or 2),
@@ -477,6 +507,7 @@ def load_extensions(
         diarization_min_speakers=diarization_min_speakers,
         diarization_max_speakers=diarization_max_speakers,
         diarization_clustering_threshold=diarization_clustering_threshold,
+        diarization_min_cluster_size=diarization_min_cluster_size,
         diarizer_embedding=diarizer_embedding,
         diarizer_embedding_model=diarizer_embedding_model,
         max_audio_seconds=float(getattr(ext_args, "max_audio_seconds", 3600.0) or 3600.0),

@@ -107,6 +107,17 @@ def _clustering_threshold(value: str) -> float:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    """argparse type：正整数（0 / 负数 / 非整数启动即报错）。"""
+    try:
+        parsed = int(str(value).strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"须为整数，收到: {value!r}")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"须为不小于 1 的整数（收到: {parsed}）")
+    return parsed
+
+
 def build_extension_parser() -> argparse.ArgumentParser:
     """扩展参数定义（默认值逐项对应 spec MODIFIED Requirement）。
 
@@ -197,6 +208,16 @@ def build_extension_parser() -> argparse.ArgumentParser:
         default=None,
         help="说话人聚类阈值服务级覆写（合法区间 (0, 2)；None = 管线默认，具体值以部署机"
         "模型 config.yaml 为准；调低更倾向拆分说话人，过度调低会过分割一人成多）",
+    )
+    parser.add_argument(
+        "--diarization-min-cluster-size",
+        type=_positive_int,
+        default=None,
+        help="说话人聚类最小簇大小服务级覆写（仅 --diarizer-embedding campplus 生效；"
+        "None = 管线默认 12）。聚类结束后样本数少于该值的簇会被合并到最近簇——"
+        "**发言很少的说话人（只说几句话）会被整个吞掉并误并入他人**。"
+        "此类场景建议设小值（如 2~4）保留小簇；设为 1 等于关闭小簇合并，"
+        "需配合 --diarization-clustering-threshold 防止过分割一人成多",
     )
     parser.add_argument(
         "--diarizer-embedding",

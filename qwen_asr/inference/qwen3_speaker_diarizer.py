@@ -352,6 +352,58 @@ class SpeakerDiarizer:
             return dict(constraints)
         return {k: v for k, v in constraints.items() if k in parameters}
 
+    def apply_clustering_hparams(self, **params: Any) -> Optional[str]:
+        """启动期把 AHC 聚类超参写入 clustering 组件（多候选探测）。
+
+        与 ``apply_clustering_threshold`` 同一套探测机制，但支持**一次性**写入
+        多个超参。必须一次写入的原因：pyannote 的 ``instantiate`` 每次调用只
+        覆盖 dict 中给出的键；若分多次调用不同键，探测阶段任一环节失败都会
+        留下"部分生效"的中间态，难以从日志判断实际生效配置。
+
+        Args:
+            **params: 写入 ``clustering`` 组件的超参键值对，如
+                ``threshold=0.5, min_cluster_size=3``。
+
+        Returns:
+            生效机制名；None 表示全部机制不可用（组件保持默认超参）。
+        """
+        if not params:
+            return None
+
+        # 候选 1：pyannote 4.x 管线级 instantiate（AHC 路径预期主机制）
+        instantiate = getattr(self.pipeline, "instantiate", None)
+        if callable(instantiate):
+            try:
+                instantiate({"clustering": dict(params)})
+                return "instantiate"
+            except Exception as exc:
+                logger.debug("instantiate 机制应用聚类超参失败: %s", exc)
+
+        # 候选 2：直接对 clustering 组件 instantiate（绕过管线级封装）
+        clustering = getattr(self.pipeline, "clustering", None)
+        cluster_instantiate = getattr(clustering, "instantiate", None)
+        if callable(cluster_instantiate):
+            try:
+                cluster_instantiate(dict(params))
+                return "clustering.instantiate"
+            except Exception as exc:
+                logger.debug("clustering.instantiate 应用聚类超参失败: %s", exc)
+
+        # 候选 3：组件属性直写（无 instantiate 时的降级路径）
+        if clustering is not None:
+            applied = []
+            try:
+                for key, value in params.items():
+                    if hasattr(clustering, key):
+                        setattr(clustering, key, value)
+                        applied.append(key)
+            except Exception as exc:
+                logger.debug("clustering 属性直写失败: %s", exc)
+            if applied:
+                return "attribute:" + ",".join(applied)
+
+        return None
+
     def apply_clustering_threshold(self, threshold: float) -> Optional[str]:
         """启动期防御式应用聚类阈值（多候选探测），返回生效机制名或 None。
 
